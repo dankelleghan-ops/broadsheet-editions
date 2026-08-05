@@ -79,13 +79,12 @@ jobs:
       - name: Build compiler cache (SwiftPM)
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
-          path: aggregator/.build
-          key: swiftpm-${{ runner.os }}-${{ hashFiles('aggregator/Package.resolved') }}
+          path: .build
+          key: swiftpm-${{ runner.os }}-${{ hashFiles('Package.resolved') }}
           restore-keys: |
             swiftpm-${{ runner.os }}-
 
       - name: Compile edition
-        working-directory: aggregator
         run: |
           mkdir -p ../state ../out
           swift run -c release compile-edition \
