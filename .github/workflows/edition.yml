@@ -30,7 +30,7 @@ permissions:
 env:
   # The publish phase sets this to the real Pages URL, e.g.
   # https://<user>.github.io/<repo>
-  BASE_URL: "https://example.invalid/broadsheet-edition"
+  BASE_URL: "https://dankelleghan-ops.github.io/broadsheet-editions"
 
 jobs:
   compile:
@@ -53,6 +53,10 @@ jobs:
         with:
           swift-version: "6.0"
 
+      - name: Install ImageMagick
+        # ubuntu-latest (24.04) images no longer preinstall ImageMagick -- proven by the first
+        # live run failing exactly here. ~20s, cached apt lists make reruns faster.
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq imagemagick
       - name: Verify ImageMagick is present
         run: command -v magick || command -v convert
 
