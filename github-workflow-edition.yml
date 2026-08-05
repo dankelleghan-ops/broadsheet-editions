@@ -86,10 +86,10 @@ jobs:
 
       - name: Compile edition
         run: |
-          mkdir -p ../state ../out
+          mkdir -p state out
           swift run -c release compile-edition \
-            --out ../out \
-            --state ../state/edition-state.json \
+            --out out \
+            --state state/edition-state.json \
             --base-url "$BASE_URL"
 
       - name: Publish to gh-pages (single force-pushed commit)
