@@ -1,0 +1,106 @@
+# Broadsheet edition compiler -- GitHub Actions workflow.
+#
+# NOT INSTALLED in this repo (deliberately: this phase is local-only). The publish phase
+# copies this file to .github/workflows/edition.yml in the PUBLIC edition repo, sets
+# BASE_URL to that repo's real GitHub Pages URL, and enables Pages on the gh-pages branch.
+#
+# Shape: every 30 minutes, compile the edition (steady-state runs are cheap -- the cached
+# state file makes most feed fetches 304s and retained articles cost zero fetches), then
+# force-push the output directory to gh-pages as a single orphan commit (history stays one
+# commit deep; Pages serves edition.json.gz + images/).
+
+name: Compile edition
+
+on:
+  schedule:
+    # Every 30 minutes. GitHub cron is best-effort; occasional skipped/late runs are fine --
+    # the next run always compiles the full 48h window from scratch-plus-cache.
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+# Overlapping runs must never double-push gh-pages. Never cancel a mid-push run; let the
+# newer one wait.
+concurrency:
+  group: compile-edition
+  cancel-in-progress: false
+
+permissions:
+  contents: write  # gh-pages force-push
+
+env:
+  # The publish phase sets this to the real Pages URL, e.g.
+  # https://<user>.github.io/<repo>
+  BASE_URL: "https://example.invalid/broadsheet-edition"
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      # Actions are pinned to full commit SHAs (not mutable tags) because this job holds a
+      # contents:write token -- a hijacked tag would otherwise run attacker code with push
+      # access to this repo. Tag -> SHA mappings recorded above each `uses:`; verified via
+      # the GitHub API at pin time (2026-08-05).
+
+      # actions/checkout v4 (v4.4.0) -> 11d5960a326750d5838078e36cf38b85af677262
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      # swift-actions/setup-swift v2 (v2.4.0) -> 7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a
+      # (the v2 ref is an annotated tag; this is the commit it dereferences to)
+      - name: Install Swift
+        uses: swift-actions/setup-swift@7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a
+        with:
+          swift-version: "6.0"
+
+      - name: Verify ImageMagick is present
+        run: command -v magick || command -v convert
+
+      # The state file (feed conditionals + compiled articles + rejection cache) and the
+      # output directory (images survive between runs) both persist via the cache. A cache
+      # miss is never fatal -- the run is just more expensive once (retained articles'
+      # images re-download from their recorded source URLs).
+      # actions/cache v4 (v4.3.0) -> 0057852bfaa89a56745cba8c7296529d2fc39830
+      - name: Restore compiler state and output
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            state/edition-state.json
+            out
+          key: edition-state-${{ github.run_id }}
+          restore-keys: |
+            edition-state-
+
+      # actions/cache v4 (v4.3.0) -> 0057852bfaa89a56745cba8c7296529d2fc39830
+      - name: Build compiler cache (SwiftPM)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: aggregator/.build
+          key: swiftpm-${{ runner.os }}-${{ hashFiles('aggregator/Package.resolved') }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-
+
+      - name: Compile edition
+        working-directory: aggregator
+        run: |
+          mkdir -p ../state ../out
+          swift run -c release compile-edition \
+            --out ../out \
+            --state ../state/edition-state.json \
+            --base-url "$BASE_URL"
+
+      - name: Publish to gh-pages (single force-pushed commit)
+        run: |
+          set -euo pipefail
+          cd out
+          # Pages must serve the .gz as-is; .nojekyll skips Jekyll processing entirely.
+          touch .nojekyll
+          git init -b gh-pages
+          git config user.name "broadsheet-edition-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          git commit -m "edition $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push --force \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
+            gh-pages
+          rm -rf .git
