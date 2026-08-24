@@ -94,6 +94,34 @@ public enum CompileEditionMain {
         do {
             let stats = try await compiler.run()
             print(report(stats))
+            // Hard-exit the success path (2026-08-23). Returning normally from here releases
+            // `compiler` -> its `client` -> the single live `Fetcher` -> `Fetcher.deinit`'s
+            // `session.finishTasksAndInvalidate()`. On Linux that starts corelibs-foundation's
+            // libcurl multi-handle teardown (`curl_multi_cleanup` -> libssl/libcrypto) on a
+            // worker thread at the same moment the process's own exit sequence is running
+            // atexit handlers -- including OpenSSL's, which tears down the very global crypto
+            // state the curl thread is still walking. Two teardowns racing over one set of
+            // globals; it lost on 2026-08-22 (run 32604568905: SIGSEGV, "Bad pointer
+            // dereference at 0x18", crashing thread mid-`URLSession._MultiHandle.deinit`).
+            //
+            // That crash cost a whole edition for nothing: the report below had already
+            // printed and edition.json.gz, the images and the state file were all on disk.
+            // The process died on the doorstep, exit code 139, so the publish step never ran.
+            //
+            // `exit`/`_exit` never return to this scope, so the compiler-inserted release that
+            // would run `Fetcher.deinit` is simply never reached -- that removes our side of
+            // the race outright. `_exit` rather than `exit` because it also skips atexit
+            // handlers, so OpenSSL's own cleanup can't race anything else still in flight.
+            // `fflush(nil)` first is mandatory, not belt-and-braces: `_exit` skips stdio
+            // flushing, and stdout is FULLY buffered (not line-buffered) whenever it is a pipe
+            // rather than a TTY -- which is exactly how GitHub Actions captures it. Without
+            // the flush the run report above would be silently discarded.
+            //
+            // Nothing is lost by exiting hard: every output is written synchronously through
+            // Foundation file APIs and re-read to compute the report's own byte counts, well
+            // before `compiler.run()` returns. No output depends on a deinit or atexit path.
+            fflush(nil)
+            _exit(0)
         } catch {
             FileHandle.standardError.write(Data("compile-edition: FAILED: \(error)\n".utf8))
             exit(1)

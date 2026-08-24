@@ -95,15 +95,43 @@ jobs:
       - name: Publish to gh-pages (single force-pushed commit)
         run: |
           set -euo pipefail
-          cd out
+
+          # The git metadata lives OUTSIDE out/, via GIT_DIR/GIT_WORK_TREE. Previously
+          # `git init` ran inside out/ itself and the step ended with `rm -rf .git` to keep
+          # the repo out of the cached `out` path -- on 2026-08-22 (run 32569673396) that rm
+          # failed with "Directory not empty" and, under `set -e`, failed the whole job AFTER
+          # the gh-pages push had already succeeded. The likeliest writer racing the rm is
+          # git's own detached auto-gc (gc.auto defaults on at 6700 loose objects, and every
+          # run commits the WHOLE out/ tree as a fresh orphan, so the threshold is reachable)
+          # still repacking .git/objects while rm walked it.
+          #
+          # Keeping .git out of out/ entirely removes the hazard by construction rather than
+          # papering over it: there is nothing inside the cached directory left to clean up,
+          # so no cleanup step can fail the run.
+          WORK_TREE="$(pwd)/out"
+          export GIT_DIR="$RUNNER_TEMP/edition-gitdir"
+          export GIT_WORK_TREE="$WORK_TREE"
+          rm -rf "$GIT_DIR"
+
           # Pages must serve the .gz as-is; .nojekyll skips Jekyll processing entirely.
-          touch .nojekyll
+          touch "$WORK_TREE/.nojekyll"
+
           git init -b gh-pages
           git config user.name "broadsheet-edition-bot"
           git config user.email "actions@users.noreply.github.com"
+          # Belt and braces: nothing should trigger gc in a single-commit throwaway repo, and
+          # it can no longer hurt us if it does.
+          git config gc.auto 0
+
           git add -A
-          git commit -m "edition $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          # --allow-empty: a fresh orphan init always has something to commit (.nojekyll at
+          # minimum), but never let a someday-empty diff kill the job under `set -e`.
+          git commit -m "edition $(date -u +%Y-%m-%dT%H:%M:%SZ)" --allow-empty
+
           git push --force \
             "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
             gh-pages
-          rm -rf .git
+
+          # $RUNNER_TEMP is discarded with the VM anyway -- tidiness only, and it must never
+          # be able to fail the job.
+          rm -rf "$GIT_DIR" || true
