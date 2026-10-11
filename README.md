@@ -6,9 +6,13 @@ The server half of Broadsheet's edition pipeline: a standalone SwiftPM package w
 downloadable "edition" bundle. Phones then download ONE bundle instead of each hitting 25
 news sites — the next big lever for refresh smoothness and battery.
 
-This phase is **local-only**: the package, its tests, and the workflow file live in this repo,
-but nothing is published anywhere yet. A later publish phase creates the public GitHub repo,
-moves `github-workflow-edition.yml` into its `.github/workflows/`, and turns on Pages.
+This is **live**: the package, its tests, and the canonical workflow file live in this repo;
+the compiler runs on GitHub Actions in the public repo
+`dankelleghan-ops/broadsheet-editions` (which carries a copy of the package plus the workflow
+at `.github/workflows/edition.yml` and a root copy, `github-workflow-edition.yml`), and
+GitHub Pages serves the `gh-pages` branch at
+`https://dankelleghan-ops.github.io/broadsheet-editions/`. Edit the workflow HERE, then copy
+the same file to both places in the editions repo so the three stay identical.
 
 ## Edition format contract v1
 
@@ -75,9 +79,10 @@ swift run -c release compile-edition \
   --state /tmp/broadsheet-edition-state.json   # optional; defaults next to --out
 ```
 
-- Requires an image tool: ImageMagick (`magick` or `convert`; preinstalled on GitHub's
-  Ubuntu runners) or `sips` (any Mac). vips is deliberately not wired up — ImageMagick is
-  guaranteed on the runners, and a third untested variant helps nobody.
+- Requires an image tool: ImageMagick (`magick` or `convert`) or `sips` (any Mac). GitHub's
+  Ubuntu 24.04 runners no longer preinstall ImageMagick, so the workflow installs it with
+  `apt-get` and checks it is present before compiling. vips is deliberately not wired up —
+  a third untested variant helps nobody.
 - The state file carries feed ETag/Last-Modified conditionals, every windowed article
   (already compiled — never re-fetched), and a 7-day negative cache of gate-rejected URLs
   (mirroring the app's GateRejectionStore). Steady-state runs are therefore mostly 304s.
@@ -115,20 +120,62 @@ detection, and the total-loss hardening (mid-run state checkpoints observed on d
 fake-clock budget truncation, item-cap drain across two runs, concurrent pipe drains past
 the 64KB buffer, and size-cap decisions plus compiler-level cap behavior).
 
-## How the Actions workflow will invoke it (publish phase)
+## How the Actions workflow runs it
 
-`github-workflow-edition.yml` (in this directory — **not installed**; the publish phase moves
-it to `.github/workflows/` in the public repo):
+`github-workflow-edition.yml` (in this directory) is the canonical copy of the workflow that
+is **installed** as `.github/workflows/edition.yml` in the public editions repo. Each run:
 
-1. cron every 30 minutes (plus manual dispatch),
-2. checkout + Swift setup on ubuntu,
-3. `actions/cache` restores the state file and the output directory (so images and
+1. checkout + Swift setup on ubuntu, then `apt-get install imagemagick`,
+2. `actions/cache` restores the state file and the output directory (so images and
    conditionals survive between runs; a cache miss just means one more expensive run —
    the compiler re-downloads retained articles' images from their recorded source URLs),
-4. `swift run -c release compile-edition --out out --base-url <the Pages URL>`,
-5. force-push `out/` to `gh-pages` as a single commit (history stays one commit deep;
-   Pages serves `edition.json.gz` + `images/`).
+3. `swift run -c release compile-edition --out out --base-url <the Pages URL>`,
+4. force-push `out/` to `gh-pages` as a single orphan commit (history stays one commit deep;
+   Pages serves `edition.json.gz` + `images/`), retried up to 3 times because one transient
+   HTTP 408 failed a run on 2026-09-29,
+5. the `rearm` job waits 20 minutes on a free timer, then starts the next run (below).
 
-Design notes the publish phase must keep: the state file lives OUTSIDE the output directory
-(it must never be published); the gh-pages push is `--force` with a fresh orphan commit each
-run; concurrency guard so overlapping crons never double-push.
+Design notes to keep: the state file lives OUTSIDE the output directory (it must never be
+published); the gh-pages push is `--force` with a fresh orphan commit each run; the
+workflow-level concurrency guard means overlapping runs never double-push; publishing is
+never skipped when nothing changed (the app reads the bundle's `generatedAt`).
+
+### Self-chaining schedule (added 2026-10-11)
+
+GitHub's free cron scheduler is best-effort. The workflow asked for every 30 minutes but
+GitHub delivered about 4.4 runs a day (median gap 5.6 hours, worst 9.3 hours, measured over
+7 days to 2026-10-11), and the app treats a bundle older than 90 minutes as stale and falls
+back to a slow crawl. So the workflow now re-arms itself instead of trusting the cron:
+
+- The `rearm` job runs after `compile` in the environment `edition-rearm`, which has a
+  20-minute **wait timer** (repo Settings > Environments). A job held by a wait timer is
+  "waiting", not running: it holds no runner and costs nothing. When the timer ends, the job
+  dispatches the next run with the built-in `GITHUB_TOKEN` (`workflow_dispatch` is one of the
+  two events that token may trigger). No external service and no new secret. A run lands
+  about every 22-23 minutes (about 2 compile + 20 wait + queue time).
+- The cron stays as a **watchdog** (`13,43 * * * *`, off the congested :00/:30 marks): if the
+  chain ever breaks, the next cron delivery restarts it.
+- Chains cannot multiply: the workflow-level concurrency group allows one run plus at most
+  one pending run, and `rearm` skips its dispatch when another run is already queued (that
+  run becomes the next link).
+- Keep-alive against GitHub's rule that scheduled workflows in a public repo are disabled
+  after 60 days without "repository activity" (the docs do not say what counts): the
+  `keepalive` job makes one empty bot commit on `main` (built-in token, API only, no checkout)
+  whenever the newest commit there is over 30 days old, so about monthly; every failure is
+  logged and ignored, and it cannot loop (no `push` trigger; `GITHUB_TOKEN` commits start no
+  runs). Test it with `gh workflow run edition.yml --repo dankelleghan-ops/broadsheet-editions
+  -f force_keepalive=true`. `rearm` also still calls the "enable workflow" API each run, a
+  harmless but unproven nudge.
+- Each `rearm` run creates a deployment record, so the repo sidebar shows "Deployments".
+
+**Restart by hand:** `gh workflow run edition.yml --repo dankelleghan-ops/broadsheet-editions`
+
+**Switch it off:** disable the workflow (`gh workflow disable edition.yml --repo
+dankelleghan-ops/broadsheet-editions`; a run that is already waiting sees this on wake-up and
+does not dispatch), or delete the `rearm` job from the workflow (cron-only again). Cancelling
+the in-flight run also stops the chain until the next watchdog delivery.
+
+**Change the cadence** without touching code: set the wait timer, e.g.
+`gh api -X PUT repos/dankelleghan-ops/broadsheet-editions/environments/edition-rearm -F wait_timer=15`.
+Keep the cycle above about 7 minutes (GitHub Pages rebuilds on every push and has a soft
+limit of 10 builds an hour).

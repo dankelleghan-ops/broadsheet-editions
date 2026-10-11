@@ -34,6 +34,14 @@
 #     mid-chain just queues behind it. `rearm` also looks for such a queued run and, if one
 #     exists, skips its own dispatch and lets that run be the next link (it re-arms in turn).
 #   - If the dispatch is skipped or fails, the watchdog and a manual run are the recovery.
+#   - KEEP-ALIVE. GitHub disables scheduled workflows in a public repo after 60 days without
+#     repository activity (its docs do not say what counts, nor that re-enabling resets the
+#     clock). A commit to `main` is the dependable reset, so the `keepalive` job makes ONE
+#     empty commit on `main` whenever the newest commit there is more than 30 days old
+#     (about once a month). It uses the built-in token through the git-data API (no
+#     checkout), runs beside `compile` and never blocks or fails the chain. This workflow
+#     has no `push` trigger and commits made with GITHUB_TOKEN start no workflow run, so it
+#     cannot loop. Exercise it on demand: gh workflow run edition.yml --ref main -f force_keepalive=true
 #
 # RESTART BY HAND:   gh workflow run edition.yml --repo dankelleghan-ops/broadsheet-editions
 # SWITCH OFF:        disable the workflow (gh workflow disable edition.yml --repo ...; a run
@@ -53,7 +61,12 @@ on:
     # Watchdog only (see SELF-CHAINING above). :13 and :43 avoid the top-of-hour and
     # half-hour marks where GitHub's scheduler is most congested.
     - cron: "13,43 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      force_keepalive:
+        description: "Make the keep-alive empty commit on main now, even if main is recent (test hook; the chain's own dispatches leave this false)"
+        type: boolean
+        default: false
 
 # Overlapping runs must never double-push gh-pages, and a second chain must never form. One
 # run in the group at a time (a run waiting on the rearm timer still holds it); at most one
@@ -187,6 +200,58 @@ jobs:
           # $RUNNER_TEMP is discarded with the VM anyway -- tidiness only, and it must never
           # be able to fail the job.
           rm -rf "$GIT_DIR" || true
+
+  # Keep-alive: one empty commit on main when its newest commit is over 30 days old, so
+  # GitHub's 60-day inactivity rule can never idle the schedule. Independent of compile and
+  # rearm (no `needs`, runs beside compile), so it cannot delay or block the next dispatch;
+  # every failure is logged and ignored. API-only: no checkout.
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write  # move refs/heads/main to the new empty commit
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      FORCE_KEEPALIVE: ${{ github.event.inputs.force_keepalive }}
+      MAX_AGE_DAYS: "30"
+    steps:
+      - name: Keep-alive commit on main (when due)
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          skip() { echo "::warning::keep-alive skipped: $1"; exit 0; }
+          api="repos/$GITHUB_REPOSITORY"
+
+          tip="$(gh api "$api/git/ref/heads/main" --jq .object.sha)" \
+            || skip "could not read the tip of main"
+          info="$(gh api "$api/git/commits/$tip" \
+              --jq '[.tree.sha, ((now - (.committer.date | fromdateiso8601)) | floor)] | @tsv')" \
+            || skip "could not read the tip commit"
+          read -r tree age_s <<< "$info"
+          echo "newest commit on main: ${tip:0:7}, $((age_s / 3600)) hour(s) old (limit ${MAX_AGE_DAYS} days)"
+
+          if [ "${FORCE_KEEPALIVE:-}" != "true" ] && [ "$age_s" -le $((MAX_AGE_DAYS * 86400)) ]; then
+            echo "Newest commit on main is recent; nothing to do."
+            exit 0
+          fi
+          [ "${FORCE_KEEPALIVE:-}" = "true" ] && echo "force_keepalive=true: committing regardless of age."
+
+          # Same tree as the tip (so the commit is empty), the tip as its only parent, authored
+          # by the same bot identity the gh-pages publish step uses.
+          new="$(gh api -X POST "$api/git/commits" \
+              -f message="keep-alive $(date -u +%F): resets GitHub's 60-day inactivity timer" \
+              -f tree="$tree" -f "parents[]=$tip" \
+              -f "author[name]=broadsheet-edition-bot" -f "author[email]=actions@users.noreply.github.com" \
+              -f "committer[name]=broadsheet-edition-bot" -f "committer[email]=actions@users.noreply.github.com" \
+              --jq .sha)" \
+            || skip "could not create the commit"
+
+          # Fast-forward only (no force): if main moved meanwhile this fails harmlessly and the
+          # next run tries again.
+          gh api -X PATCH "$api/git/refs/heads/main" -f sha="$new" --silent \
+            || skip "could not move main to ${new:0:7}"
+          echo "Keep-alive commit ${new:0:7} is now the tip of main (parent ${tip:0:7})."
 
   # Re-arm: wait out the environment's 20-minute timer, then dispatch the next run. See
   # SELF-CHAINING at the top of this file. Runs whether compile succeeded or failed (a bad
