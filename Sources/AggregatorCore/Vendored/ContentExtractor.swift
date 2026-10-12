@@ -382,7 +382,7 @@ final class ContentExtractor {
 
     fileprivate static func buildArticle(title: String, blocks rawBlocks: [BodyBlock], ogImageURL: URL?,
                                           author: String? = nil, authorInstitution: String? = nil,
-                                          url: URL? = nil) -> ExtractedArticle {
+                                          url: URL? = nil, publishedAt: Date? = nil) -> ExtractedArticle {
         // Cheap minor (fix round 1): trimTrailingChromeRun runs BEFORE hero/allImageURLs are
         // computed below, and both are derived from `blocks` (the trimmed list), not
         // `rawBlocks` -- so an uncaptioned image that fix C trims off the tail is already gone
@@ -407,7 +407,7 @@ final class ContentExtractor {
 
         return ExtractedArticle(title: title, byline: nil, bodyBlocks: blocks, heroImageURL: heroImageURL,
                                  allImageURLs: allImageURLs, author: author, authorInstitution: authorInstitution,
-                                 url: url)
+                                 url: url, publishedAt: publishedAt)
     }
 
     func extract(fromPageHTML html: String, articleURL: URL, item: FeedItem, config: SourceConfig) throws -> ExtractedArticle {
@@ -420,6 +420,9 @@ final class ContentExtractor {
         // never depends on the author markup surviving junk-stripping, which it structurally
         // cannot on this source.
         let pageByline = Self.pageAuthorAndInstitution(in: doc)
+        // Read for the same reason as the byline: `stripJunk` removes every <script>, which is where
+        // JSON-LD `datePublished` lives.
+        let pagePublished = Self.pagePublishedAt(in: doc)
 
         Self.stripJunk(doc, additionalSelectors: config.junkSelectors)
 
@@ -443,7 +446,17 @@ final class ContentExtractor {
             }
         }
 
-        let ogImageURL = Self.ogImageURL(in: doc, baseURL: articleURL)
+        var ogImageURL = Self.ogImageURL(in: doc, baseURL: articleURL)
+
+        // A social image with a logo/text stamp burned in by the publisher's image service is a
+        // share card, not the article's photograph -- prefer the page's own lead photo, else its
+        // first body photo (which then leaves the body so it is not shown twice). See
+        // "Stamped social images" below.
+        if let og = ogImageURL, Self.isStampedSocialImage(og),
+           let replacement = Self.unstampedHero(in: doc, blocks: blocks, baseURL: articleURL) {
+            ogImageURL = replacement.url
+            blocks = replacement.blocks
+        }
 
         // v1.8 (spec item 1): the page's own byline wins outright when present; the feed's
         // combined byline (Atom <author><name> / RSS <dc:creator>, see FeedItem.author) is only
@@ -466,7 +479,60 @@ final class ContentExtractor {
         }
 
         return Self.buildArticle(title: item.title, blocks: blocks, ogImageURL: ogImageURL,
-                                  author: author, authorInstitution: authorInstitution, url: articleURL)
+                                  author: author, authorInstitution: authorInstitution, url: articleURL,
+                                  publishedAt: pagePublished)
+    }
+
+    // MARK: - Page publish time
+    //
+    // Some feeds carry no date the parser can read (NBC 5's was zone-less, Sun-Times' had fractional
+    // seconds; both fixed in FeedParser) and a page-extract source's PAGE always states one. Order of
+    // preference: the ORIGINAL publish time only -- `article:published_time` and the like, then JSON-LD
+    // `datePublished`, then a `<time itemprop=datePublished>` -- never `dateModified`/`updated`. A stamp
+    // without an explicit zone (or a bare date) is NOT used: `FeedDates.parse` reads it as nil.
+
+    /// The page's original publish time, or nil when it states none with a zone.
+    static func pagePublishedAt(inPageHTML html: String) -> Date? {
+        guard let doc = try? SwiftSoup.parse(html) else { return nil }
+        return pagePublishedAt(in: doc)
+    }
+
+    fileprivate static func pagePublishedAt(in doc: Document) -> Date? {
+        let metaSelectors = [
+            "meta[property=article:published_time]", "meta[property=og:article:published_time]",
+            "meta[name=article:published_time]", "meta[itemprop=datePublished]", "meta[name=pubdate]",
+            "meta[name=publish-date]", "meta[name=parsely-pub-date]", "meta[name=DC.date.issued]"
+        ]
+        for selector in metaSelectors {
+            guard let metas = try? doc.select(selector) else { continue }
+            for meta in metas.array() {
+                if let date = FeedDates.parse(try? meta.attr("content")) { return date }
+            }
+        }
+        if let scripts = try? doc.select("script[type=application/ld+json]") {
+            func walk(_ node: Any) -> Date? {
+                if let array = node as? [Any] {
+                    for element in array { if let date = walk(element) { return date } }
+                    return nil
+                }
+                guard let dict = node as? [String: Any] else { return nil }
+                if let stated = dict["datePublished"] as? String, let date = FeedDates.parse(stated) { return date }
+                for key in dict.keys.sorted() { if let value = dict[key], let date = walk(value) { return date } }
+                return nil
+            }
+            for script in scripts.array() {
+                guard let text = try? script.data(), let data = text.data(using: .utf8),
+                      let json = try? JSONSerialization.jsonObject(with: data), let date = walk(json) else { continue }
+                return date
+            }
+        }
+        for selector in ["time[itemprop=datePublished]", "time.published", "time.entry-date.published", "time[pubdate]"] {
+            guard let times = try? doc.select(selector) else { continue }
+            for time in times.array() {
+                if let date = FeedDates.parse(try? time.attr("datetime")) { return date }
+            }
+        }
+        return nil
     }
 
     // MARK: - v1.8: author / institution extraction (spec item 1)
@@ -823,6 +889,383 @@ final class ContentExtractor {
             if !text.isEmpty { count += 1 }
         }
         return count
+    }
+
+    // MARK: - Stamped social images (hero selection)
+    //
+    // A page's og:image is a SHARE CARD, not necessarily the article's photograph, and some
+    // publishers' image services stamp their logo (or text) onto it. Confirmed live 2026-10-11 on
+    // theguardian.com, where EVERY article's og:image is a signed URL of the form
+    //   i.guim.co.uk/img/media/<asset>/<crop>/master/<n>.jpg?width=1200&height=630&quality=85
+    //   &auto=format&fit=crop&precrop=40:21,...&overlay-align=bottom%2Cleft&overlay-width=100p
+    //   &overlay-base64=<base64 of "/img/static/overlays/tg-default.png">&enable=upscale&s=<sig>
+    // i.e. a 1200x630 landscape CROP of the photo with "The Guardian" burned into the corner. The
+    // URL is signed (`s=`), so the overlay parameters cannot simply be removed. The same page
+    // offers the real photograph: its lead figure's <picture> lists signed renditions up to 1400 px
+    // wide (`width=700&dpr=2&s=none&crop=none`).
+    //
+    // The rule, applied only when the og:image URL carries a stamp parameter (so every other
+    // source -- sampled 2026-10-11, 13 of 14 clean -- behaves exactly as before):
+    //   1. the page's lead figure: the first <figure> with a usable image that comes before the
+    //      first real body paragraph, taking its widest page-offered JPEG/PNG rendition;
+    //   2. else the first image block of the extracted body;
+    //   3. else keep the og:image (a branded photo beats no photo).
+    // Whichever photo is promoted to hero is removed from the body's first image block when it is
+    // the same photo, so the reader never shows it twice. Trade-off, stated plainly: a caption or
+    // credit that lived only on that removed block goes with it (the reader's hero has no caption
+    // slot of its own). For Guardian the lead sits outside the body, so nothing is removed and
+    // nothing is lost.
+
+    /// Query-parameter NAMES that ask an image service to burn something onto the picture:
+    /// `overlay*` (Guardian/Fastly `overlay-base64`, `overlay-align`, ...), `watermark*`, and the
+    /// imgix text/mark/blend families (`txt`, `txt64`, `txt-size`, `mark`, `mark64`, `blend`, ...).
+    /// Matched against whole parameter names, never substrings, so `markdown` or a path word
+    /// cannot trip it.
+    private static let stampParameterPattern = "^(overlay.*|watermark.*|(txt|mark|blend)(64|-[a-z0-9]+)?)$"
+
+    /// True when `url` carries a logo/text-stamping query parameter (see above).
+    static func isStampedSocialImage(_ url: URL) -> Bool {
+        guard let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems else { return false }
+        return items.contains {
+            $0.name.range(of: stampParameterPattern, options: [.regularExpression, .caseInsensitive]) != nil
+        }
+    }
+
+    /// A lead photo narrower than this (in pixels, when the page says) is a thumbnail, not a hero.
+    private static let minimumHeroWidth = 600
+    /// The "lead region" of a page ends at the first body paragraph this long (characters).
+    private static let leadRegionEndsAtParagraphLength = 60
+
+    private struct Rendition {
+        let url: URL
+        /// Effective pixel width the page advertises for this URL; 0 when it says nothing.
+        let width: Int
+    }
+
+    /// The replacement hero and the (possibly shortened) body blocks, or nil when the page offers
+    /// no unstamped alternative.
+    private static func unstampedHero(in doc: Document, blocks: [BodyBlock],
+                                      baseURL: URL) -> (url: URL, blocks: [BodyBlock])? {
+        if let lead = leadFigure(in: doc, baseURL: baseURL) {
+            var remaining = blocks
+            // The lead figure may ALSO be the body's first image block (it is, wherever the body
+            // selector encloses the lead -- e.g. BBC's `article`). Remove that block: exact match
+            // on the URL this very figure produces as a block, else the same photo under another
+            // rendition (shared asset id) as the body's FIRST image block only.
+            let ownBlockURL = (try? lead.figure.select("img").first())
+                .flatMap { resolveImageURL($0, baseURL: baseURL)?.absoluteString }
+            if let ownBlockURL,
+               let index = remaining.firstIndex(where: { $0.kind == .image && $0.imageURLString == ownBlockURL }) {
+                remaining.remove(at: index)
+            } else if let index = remaining.firstIndex(where: { $0.kind == .image }),
+                      let firstURL = remaining[index].imageURLString.flatMap({ URL(string: $0) }),
+                      samePhoto(firstURL, lead.rendition.url) {
+                remaining.remove(at: index)
+            }
+            return (lead.rendition.url, remaining)
+        }
+        if let index = blocks.firstIndex(where: {
+            guard $0.kind == .image, let s = $0.imageURLString, let u = URL(string: s) else { return false }
+            return !isStampedSocialImage(u)
+        }), let url = blocks[index].imageURLString.flatMap({ URL(string: $0) }) {
+            var remaining = blocks
+            remaining.remove(at: index)
+            return (url, remaining)
+        }
+        return nil
+    }
+
+    /// The page's lead figure and its best rendition. Scans the story's `<figure>`s in document
+    /// order, but only until the first real body paragraph -- a mid-article photo or a related-
+    /// stories thumbnail is never "the lead".
+    private static func leadFigure(in doc: Document, baseURL: URL) -> (figure: Element, rendition: Rendition)? {
+        let scope: Element = fallbackScopeRoot(in: doc) ?? doc.body() ?? doc
+        guard let nodes = try? scope.select("figure, p") else { return nil }
+        for node in nodes.array() {
+            if isDescendant(ofNestedArticleWithin: scope, node) { continue }
+            if node.tagName().lowercased() == "p" {
+                if isDescendant(of: "figure", node) || isDescendant(of: "figcaption", node) { continue }
+                if ((try? plainText(node)) ?? "").count >= leadRegionEndsAtParagraphLength { return nil }
+                continue
+            }
+            if isDescendant(of: "figure", node) { continue }
+            guard let rendition = bestRendition(inFigure: node, baseURL: baseURL) else { continue }
+            if rendition.width > 0, rendition.width < minimumHeroWidth { continue }
+            if isStampedSocialImage(rendition.url) { continue }
+            return (node, rendition)
+        }
+        return nil
+    }
+
+    /// The best JPEG/PNG rendition a figure's image offers (see `renditionCandidates` and `pickRendition`).
+    private static func bestRendition(inFigure figure: Element, baseURL: URL) -> Rendition? {
+        guard let img = (try? figure.select("img"))?.first() else { return nil }
+        let found = renditionCandidates(forImage: img, baseURL: baseURL)
+        return pickRendition(from: found.all, imgSrc: found.imgSrc)
+    }
+
+    /// The pipeline keeps a photo at 1400 px (the aggregator's cap; the phone's is 1600), so more than
+    /// that is wasted bytes. Of the candidates whose width the page states: the SMALLEST that reaches
+    /// `heroTargetWidth`, else the widest there is. When the page states no width for any, the `<img>`
+    /// the browser would show.
+    private static let heroTargetWidth = 1400
+    /// A candidate wider than this is a camera original (Block Club's srcset ends in a 4928 px file):
+    /// megabytes to fetch for a photo that is stored at 1400, so it is only used when it is all there is.
+    private static let heroOriginalWidth = 3200
+
+    private static func pickRendition(from candidates: [Rendition], imgSrc: Rendition?) -> Rendition? {
+        guard let first = candidates.first else { return nil }
+        let known = candidates.filter { $0.width > 0 }
+        guard !known.isEmpty else { return imgSrc ?? first }
+        let sensible = known.filter { $0.width <= heroOriginalWidth }
+        let pool = sensible.isEmpty ? known : sensible
+        if let smallestEnough = pool.filter({ $0.width >= heroTargetWidth }).min(by: { $0.width < $1.width }) {
+            return smallestEnough
+        }
+        return pool.max(by: { $0.width < $1.width })
+    }
+
+    /// Every JPEG/PNG rendition one image offers: all `srcset`/`data-srcset` candidates of its
+    /// `<picture>` sources and `<img>` (WebP/AVIF skipped -- the phone and the aggregator both want a
+    /// plain JPEG/PNG), plus `src`/`data-src` (`data:` lazy-load placeholders skipped). Width comes from
+    /// a `w` descriptor, else `x` x the declared width, else the URL's own `width`/`w` x `dpr`
+    /// (Guardian encodes size in the query), else the `width` attribute; 0 = the page doesn't say.
+    private static func renditionCandidates(forImage img: Element,
+                                            baseURL: URL) -> (all: [Rendition], imgSrc: Rendition?) {
+        var carriers: [Element] = [img]
+        if let picture = img.parent(), picture.tagName().lowercased() == "picture",
+           let all = try? picture.select("source, img") {
+            carriers = all.array()
+        }
+
+        var candidates: [Rendition] = []
+        var imgSrc: Rendition?
+        for carrier in carriers {
+            let isSource = carrier.tagName().lowercased() == "source"
+            let type = ((try? carrier.attr("type")) ?? "").lowercased()
+            if isSource, type.contains("webp") || type.contains("avif") { continue }
+            let declaredWidth = Int(((try? carrier.attr("width")) ?? "").trimmingCharacters(in: .whitespaces)) ?? 0
+
+            for attribute in ["srcset", "data-srcset"] {
+                for (raw, descriptor) in srcsetCandidates((try? carrier.attr(attribute)) ?? "") {
+                    guard let url = absolutize(raw, baseURL: baseURL), isPlainRaster(url) else { continue }
+                    candidates.append(Rendition(url: url, width: effectiveWidth(of: url, descriptor: descriptor,
+                                                                                declaredWidth: declaredWidth)))
+                }
+            }
+            for attribute in ["data-src", "src"] {
+                let raw = (try? carrier.attr(attribute)) ?? ""
+                guard !raw.isEmpty, let url = absolutize(raw, baseURL: baseURL), isPlainRaster(url) else { continue }
+                let rendition = Rendition(url: url, width: effectiveWidth(of: url, descriptor: nil,
+                                                                          declaredWidth: declaredWidth))
+                candidates.append(rendition)
+                if !isSource, imgSrc == nil { imgSrc = rendition }
+            }
+        }
+        return (candidates, imgSrc)
+    }
+
+    /// A real http(s) raster URL: not a lazy-load `data:` placeholder, not WebP/AVIF/SVG/GIF.
+    private static func isPlainRaster(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return false }
+        let ext = url.pathExtension.lowercased()
+        return ext != "webp" && ext != "avif" && ext != "svg" && ext != "gif"
+    }
+
+    /// Splits a `srcset` value into (url, descriptor) pairs, following the HTML parsing rules: a
+    /// candidate's URL is the run up to the next whitespace (so URLs that contain commas -- Cloudinary
+    /// transforms, Guardian `precrop=40:21,offset-x50` -- stay whole), trailing commas are stripped
+    /// from it, and its descriptor (`400w`, `2x`) runs to the next comma. That also handles lists
+    /// written with NO space after the comma, e.g. Brightspot's `url 1x,url 2x`.
+    private static func srcsetCandidates(_ value: String) -> [(String, String?)] {
+        let chars = Array(value)
+        func isSpace(_ c: Character) -> Bool { c == " " || c == "\n" || c == "\t" || c == "\r" || c == "\u{0C}" }
+        var result: [(String, String?)] = []
+        var i = 0
+        while i < chars.count {
+            while i < chars.count, isSpace(chars[i]) || chars[i] == "," { i += 1 }
+            guard i < chars.count else { break }
+            var url = ""
+            while i < chars.count, !isSpace(chars[i]) { url.append(chars[i]); i += 1 }
+            var descriptor: String? = nil
+            if url.hasSuffix(",") {
+                while url.hasSuffix(",") { url.removeLast() }
+            } else {
+                while i < chars.count, isSpace(chars[i]) { i += 1 }
+                var raw = ""
+                while i < chars.count, chars[i] != "," { raw.append(chars[i]); i += 1 }
+                descriptor = raw.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" })
+                    .first.map(String.init)
+            }
+            if !url.isEmpty { result.append((url, descriptor)) }
+        }
+        return result
+    }
+
+    private static func effectiveWidth(of url: URL, descriptor: String?, declaredWidth: Int) -> Int {
+        if let descriptor = descriptor?.lowercased() {
+            if descriptor.hasSuffix("w"), let w = Int(descriptor.dropLast()) { return w }
+            if descriptor.hasSuffix("x"), let x = Double(descriptor.dropLast()), declaredWidth > 0 {
+                return Int((Double(declaredWidth) * x).rounded())
+            }
+        }
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        func value(_ names: [String]) -> String? {
+            items.first(where: { names.contains($0.name.lowercased()) })?.value
+        }
+        if let width = value(["width", "w"]).flatMap({ Int($0) }) {
+            let dpr = value(["dpr"]).flatMap { Double($0) } ?? 1
+            return Int((Double(width) * dpr).rounded())
+        }
+        if declaredWidth > 0 { return declaredWidth }
+        // Last resort: the size baked into the URL itself (Brightspot `/resize/1486x991!/`, Jetpack
+        // `?resize=1536,1024`).
+        return resizeDimensions(of: url)?.width ?? 0
+    }
+
+    /// The final pixel size a resizing-proxy URL asks for: Brightspot's `/resize/<W>x<H>` path segment or
+    /// a `?resize=<W>,<H>` query (WordPress/Jetpack). nil when the URL carries neither.
+    private static func resizeDimensions(of url: URL) -> (width: Int, height: Int)? {
+        if let range = url.path.range(of: "/resize/\\d+x\\d+", options: .regularExpression) {
+            let parts = url.path[range].dropFirst("/resize/".count).split(separator: "x")
+            if parts.count == 2, let w = Int(parts[0]), let h = Int(parts[1]), w > 0, h > 0 { return (w, h) }
+        }
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        for name in ["resize", "fit"] {
+            if let value = items.first(where: { $0.name == name })?.value {
+                let parts = value.split(whereSeparator: { $0 == "," || $0 == "x" })
+                if parts.count == 2, let w = Int(parts[0]), let h = Int(parts[1]), w > 0, h > 0 { return (w, h) }
+            }
+        }
+        return nil
+    }
+
+    /// Renditions the page publishes as schema.org structured data: `ImageObject` entries (with their
+    /// stated `width`) anywhere in the page's `application/ld+json` blocks. WBEZ and the Sun-Times list
+    /// their uncropped 3:2 photo there at 1486x991, which the page's own `<img>` tags (16:9 crops) lack.
+    private static func jsonLDImageRenditions(in doc: Document, baseURL: URL) -> [Rendition] {
+        guard let scripts = try? doc.select("script[type=application/ld+json]") else { return [] }
+        var found: [Rendition] = []
+        func walk(_ node: Any) {
+            if let array = node as? [Any] { array.forEach(walk); return }
+            guard let dict = node as? [String: Any] else { return }
+            if (dict["@type"] as? String) == "ImageObject", let raw = dict["url"] as? String,
+               let url = absolutize(raw, baseURL: baseURL), isPlainRaster(url) {
+                let stated = (dict["width"] as? NSNumber)?.intValue ?? Int((dict["width"] as? String) ?? "") ?? 0
+                found.append(Rendition(url: url, width: stated > 0
+                                        ? stated : effectiveWidth(of: url, descriptor: nil, declaredWidth: 0)))
+            }
+            dict.values.forEach(walk)
+        }
+        for script in scripts.array() {
+            guard let text = try? script.data(), let data = text.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) else { continue }
+            walk(json)
+        }
+        return found
+    }
+
+    /// Two renditions are the same FRAMING when both state their final size and the aspect ratios agree
+    /// within 3%; when either doesn't say, they are assumed compatible. Keeps a 3:2 feed hero from being
+    /// swapped for a 16:9 crop of the same photo (WBEZ's page layout), which would change the composition.
+    private static func sameFraming(_ a: URL, _ b: URL) -> Bool {
+        guard let da = resizeDimensions(of: a), let db = resizeDimensions(of: b) else { return true }
+        let ra = Double(da.width) / Double(da.height), rb = Double(db.width) / Double(db.height)
+        return abs(ra - rb) / rb <= 0.03
+    }
+
+    /// "Same photograph": same host and either the same path or a shared long asset id (a path
+    /// segment of 24+ characters containing a digit, extension stripped -- Guardian's 40-hex asset
+    /// hash, BBC's UUID filename). Renditions of one photo differ only in size/crop segments. For
+    /// resizing proxies that carry the original in a `url=` query parameter (Brightspot's `dims4`,
+    /// used by Sun-Times/WBEZ/NPR) the ORIGINAL's host and path are what is compared.
+    private static func samePhoto(_ a: URL, _ b: URL) -> Bool {
+        guard let assetA = canonicalAsset(a), let assetB = canonicalAsset(b), assetA.host == assetB.host else {
+            return false
+        }
+        if assetA.path == assetB.path { return true }
+        return !assetTokens(path: assetA.path).isDisjoint(with: assetTokens(path: assetB.path))
+    }
+
+    private static func canonicalAsset(_ url: URL) -> (host: String, path: String)? {
+        if let embedded = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
+            .first(where: { $0.name == "url" })?.value,
+           let inner = URL(string: embedded), let innerHost = inner.host {
+            return (innerHost.lowercased(), inner.path)
+        }
+        guard let host = url.host else { return nil }
+        return (host.lowercased(), url.path)
+    }
+
+    private static func assetTokens(path: String) -> Set<String> {
+        var tokens = Set<String>()
+        for segment in path.split(separator: "/") {
+            var s = String(segment).lowercased()
+            while let dot = s.lastIndex(of: "."), s.distance(from: dot, to: s.endIndex) <= 5 {
+                s = String(s[..<dot])
+            }
+            // A hash/UUID-like id: long, has a digit, and NO dots (a dotted segment is a host name such
+            // as Jetpack's `bcc-newspack.s3.amazonaws.com`, which every image of a site shares).
+            if s.count >= 24, !s.contains("."), s.contains(where: { $0.isNumber }) { tokens.insert(s) }
+        }
+        return tokens
+    }
+
+    // MARK: - Page rendition upgrade for FEED-TEXT sources (hero upgrade)
+    //
+    // Sources whose text arrives in the feed (Sun-Times, WBEZ: both Brightspot) never fetch the article
+    // page, so their hero is whatever rendition the FEED carries -- 840 px wide for those two. The page
+    // itself lists the same lead photo at 1680 px (`<img srcset="...840 1x,...1680 2x">`, signed
+    // `dims4` URLs the publisher publishes). On an iPad, where a hero is drawn about 700 pt (1400 px)
+    // wide, 840 px is visibly soft. The aggregator opts sources in (see
+    // `EditionCompiler.pageHeroUpgradeSourceIDs`) and calls `upgradingHero` with the article page.
+    //
+    // Safety comes from IDENTITY, not position: only renditions of the SAME photograph as the feed's
+    // hero (`samePhoto`) are ever considered, wherever on the page they sit, so a related-story
+    // thumbnail or an ad image can never be promoted.
+
+    /// `article` with its hero swapped for the page's best rendition OF THE SAME PHOTO (every `<img>`/
+    /// `<picture>` on the page is searched; see `pickRendition` for the width rule), and only when that
+    /// is wider than the width the current hero URL declares. The body's first image block (the feed's
+    /// own copy of that photo) is dropped so it is not shown twice. nil = nothing to upgrade (no hero,
+    /// the photo isn't on the page, or no gain).
+    static func upgradingHero(of article: ExtractedArticle, fromPageHTML html: String,
+                              pageURL: URL) -> ExtractedArticle? {
+        guard let currentHero = article.heroImageURL, let doc = try? SwiftSoup.parse(html),
+              let images = try? doc.select("img") else { return nil }
+
+        var candidates: [Rendition] = []
+        var imgSrc: Rendition?
+        for img in images.array() {
+            let found = renditionCandidates(forImage: img, baseURL: pageURL)
+            let same = found.all.filter { samePhoto(currentHero, $0.url) && sameFraming(currentHero, $0.url) }
+            guard !same.isEmpty else { continue }
+            candidates.append(contentsOf: same)
+            if imgSrc == nil { imgSrc = found.imgSrc.flatMap { candidate in same.contains { $0.url == candidate.url } ? candidate : nil } }
+        }
+        candidates.append(contentsOf: jsonLDImageRenditions(in: doc, baseURL: pageURL)
+            .filter { samePhoto(currentHero, $0.url) && sameFraming(currentHero, $0.url) })
+        // A candidate whose size the page doesn't state is never an "upgrade".
+        guard let best = pickRendition(from: candidates, imgSrc: imgSrc), best.url != currentHero,
+              best.width > 0 else { return nil }
+        let currentWidth = declaredWidth(inURL: currentHero)
+        if currentWidth > 0, best.width <= currentWidth { return nil }
+
+        var blocks = article.bodyBlocks
+        if let index = blocks.firstIndex(where: { $0.kind == .image }),
+           let blockURL = blocks[index].imageURLString.flatMap({ URL(string: $0) }),
+           samePhoto(blockURL, best.url) {
+            blocks.remove(at: index)
+        }
+        return buildArticle(title: article.title, blocks: blocks, ogImageURL: best.url,
+                            author: article.author, authorInstitution: article.authorInstitution,
+                            url: article.url, publishedAt: article.publishedAt)
+    }
+
+    /// Pixel width a URL advertises for itself (`width`/`w` x `dpr`, else the baked-in resize size); 0
+    /// when it says nothing.
+    private static func declaredWidth(inURL url: URL) -> Int {
+        effectiveWidth(of: url, descriptor: nil, declaredWidth: 0)
     }
 
     // MARK: - og:image

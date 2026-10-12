@@ -37,6 +37,11 @@ struct EditionArticle: Codable, Equatable {
     let topImageURL: String?
     /// The v1.8 Conversation credit line when the source requires attribution, else nil.
     let attribution: String?
+    /// ADDITIVE optional field (2026-10-12): `true` only when no real publish time could be found for
+    /// this article (no usable feed date, none on the page) and `publishedAt` is the compiler's
+    /// first-seen time. Omitted otherwise, so the bundle stays the same size and builds that predate
+    /// the field never see it. Contract v1 is otherwise unchanged.
+    var dateIsEstimated: Bool? = nil
 }
 
 /// The one true bodyBlocks encoder: the exact call `ArticleStore.downloadItems` makes

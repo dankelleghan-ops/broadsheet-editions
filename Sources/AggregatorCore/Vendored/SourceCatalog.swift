@@ -286,7 +286,12 @@ enum SourceCatalog {
             id: "nbc5",
             name: "NBC5 Chicago",
             feeds: [
-                FeedEndpoint(url: URL(string: "https://nbcchicago.com/news/?rss=y")!, defaultCategory: .chicago)
+                // The feed's <pubDate>/<updateDate> are written `Sun, Oct 11 2026 04:04:04 PM` with NO zone
+                // (verified 2026-10-11 against four article pages' JSON-LD `datePublished`, e.g.
+                // `2026-10-11T16:04:04-05:00`): Chicago local time. Until this was declared, every NBC 5
+                // item parsed as undated and was stamped with the compile time instead.
+                FeedEndpoint(url: URL(string: "https://nbcchicago.com/news/?rss=y")!, defaultCategory: .chicago,
+                             zonelessDatesTimeZone: TimeZone(identifier: "America/Chicago"))
             ],
             strategy: .pageExtract,
             weight: 0.75,

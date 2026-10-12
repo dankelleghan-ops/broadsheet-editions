@@ -7,6 +7,12 @@ enum FetchStrategy: String, Codable {
 struct FeedEndpoint: Sendable {
     let url: URL
     let defaultCategory: ArticleCategory
+    /// The time zone this feed's ZONE-LESS timestamps are written in. NBC 5 Chicago publishes
+    /// `<pubDate>Sun, Oct 11 2026 04:04:04 PM</pubDate>` with no zone at all; the article pages'
+    /// own `datePublished` (`2026-10-11T16:04:04-05:00`) show it is Chicago local time. A zone-less
+    /// timestamp is only ever parsed when the feed declares its zone here -- never guessed -- so
+    /// every other feed keeps treating one as "no date".
+    var zonelessDatesTimeZone: TimeZone? = nil
 }
 
 struct SourceConfig: Identifiable, Sendable {
@@ -198,4 +204,11 @@ struct ExtractedArticle: Equatable {
     /// (every test that constructs `ExtractedArticle` directly) keeps compiling unchanged; a
     /// `nil` URL just skips straight to the general fallback, same as any other source.
     var url: URL? = nil
+    /// The article's own ORIGINAL publish time as the PAGE states it (JSON-LD `datePublished`,
+    /// `article:published_time`, ...), when the page was fetched and carries one with an explicit
+    /// time zone. Never the "modified" time. nil for feed-text articles (no page) and pages that
+    /// state none. The date of record is still the feed item's; this is the fallback for feeds
+    /// that carry no usable date (the compiler and the app's own crawl both use it before ever
+    /// guessing "now").
+    var publishedAt: Date? = nil
 }

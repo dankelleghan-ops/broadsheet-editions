@@ -75,9 +75,15 @@ struct CompiledArticle: Codable, Equatable {
     var title: String
     var author: String?
     var attribution: String?
-    /// The app's convention: `item.publishedAt ?? now` at first compile (an undated item
-    /// windows out 48h after first sight).
+    /// The article's real publish time: the feed item's date, else the page's own `datePublished`;
+    /// only when NEITHER exists the compile time (`dateIsEstimated == true`; such an article windows
+    /// out 48h after first sight).
     var publishedAt: Date
+    /// `true` = `publishedAt` is the compiler's first-seen time (a guess); `false` = a real date;
+    /// `nil` = compiled before this field existed (unknown -- treated as possibly estimated, so a real
+    /// feed date that is EARLIER corrects it, see `EditionCompiler.run`). Optional so every old state
+    /// file still decodes.
+    var dateIsEstimated: Bool? = nil
     var bodyBlocksJSON: String
     /// Content hash of the resized JPEG (first 16 hex of sha256) -- the image's filename in
     /// images/. nil = article has no usable hero image.

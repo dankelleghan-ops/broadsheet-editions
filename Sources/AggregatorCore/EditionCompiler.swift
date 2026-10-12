@@ -52,6 +52,19 @@ struct SourceRunStats {
     var failures = 0
     var imagesWritten = 0
     var imageFailures = 0
+    /// Feed-text articles whose hero was swapped for a wider rendition found on the article page
+    /// (see `EditionCompiler.pageHeroUpgradeSourceIDs`).
+    var heroUpgrades = 0
+    /// New articles whose date came from the article PAGE because the feed item carried none.
+    var datesFromPage = 0
+    /// New articles with NO real date anywhere (no usable feed date, none on the page): stamped with the
+    /// compile time and marked `dateIsEstimated` in the edition. Should be 0 for a healthy source.
+    var datesEstimated = 0
+    /// Already-compiled articles whose guessed/stale date was replaced by the real one the feed now carries.
+    var datesCorrected = 0
+    /// Undated feed items whose PAGE date showed they are older than the edition window: not compiled
+    /// (and negative-cached, so the page is not fetched again every run).
+    var staleByPageDate = 0
     /// Finding 3c: true when the per-run eligible-item cap cut this source's survey short.
     var hitItemCap = false
 }
@@ -113,14 +126,15 @@ final class EditionCompiler {
         // Phase B. A checkpoint carrying a fresher conditional than the articles it actually
         // compiled would make the next run 304 straight past the items a killed run lost.
         let knownGUIDs = Set(state.articles.map(\.guid))
+        let retainedDates = Dictionary(state.articles.map { ($0.guid, $0) }, uniquingKeysWith: { first, _ in first })
         let rejected = Set(state.rejectedURLs.keys)
         let conditionals = state.feedConditionals
         var surveys: [SourceSurveyResult] = []
         let surveysSkipped = await boundedConcurrentForEach(catalog, limit: config.surveyConcurrency,
                                                             shouldStartMore: withinBudget,
                                                             transform: { source in
-            await self.survey(source: source, knownGUIDs: knownGUIDs, rejectedURLStrings: rejected,
-                              conditionals: conditionals, now: now)
+            await self.survey(source: source, knownGUIDs: knownGUIDs, retainedDates: retainedDates,
+                              rejectedURLStrings: rejected, conditionals: conditionals, now: now)
         }, onResult: { surveys.append($0) })
 
         // Phase B: download/extract/gate the new items; write hero images. State checkpoints
@@ -129,6 +143,7 @@ final class EditionCompiler {
         var stats = RunStats()
         let retainedAtStart = state.articles
         var newArticles: [CompiledArticle] = []
+        var dateCorrections: [String: Date] = [:]
         let downloadsSkipped = await boundedConcurrentForEach(surveys, limit: config.downloadConcurrency,
                                                               shouldStartMore: withinBudget,
                                                               transform: { survey in
@@ -136,6 +151,7 @@ final class EditionCompiler {
         }, onResult: { download in
             stats.perSource.append(download.stats)
             newArticles.append(contentsOf: download.articles)
+            dateCorrections.merge(download.dateCorrections) { first, _ in first }
             for url in download.rejectedURLs {
                 state.recordRejection(url, now: now)
             }
@@ -152,6 +168,23 @@ final class EditionCompiler {
 
         // Phase C: merge, restore any retained image the output-dir cache lost, emit, prune.
         var retained = retainedAtStart
+        // Date corrections for already-compiled articles (see `survey`). The guid -- the state key and the
+        // phone's dedupe key -- never changes, so a correction can neither duplicate an article nor make
+        // it look new; only `publishedAt`/`dateIsEstimated` move. An article whose REAL date puts it
+        // outside the window leaves the edition here, exactly as it would have had it been dated
+        // correctly in the first place; it is not re-added later (the survey applies the same cutoff).
+        if !dateCorrections.isEmpty {
+            for index in retained.indices {
+                guard let real = dateCorrections[retained[index].guid] else { continue }
+                retained[index].publishedAt = real
+                retained[index].dateIsEstimated = false
+                if let statsIndex = stats.perSource.firstIndex(where: { $0.sourceID == retained[index].sourceID }) {
+                    stats.perSource[statsIndex].datesCorrected += 1
+                }
+            }
+            let cutoff = now.addingTimeInterval(-config.windowSeconds)
+            retained.removeAll { $0.publishedAt < cutoff }
+        }
         await restoreMissingImages(for: &retained, imagesDir: imagesDir)
         let merged = retained + newArticles
         state.articles = merged
@@ -183,6 +216,9 @@ final class EditionCompiler {
         let source: SourceConfig
         var eligibleItems: [FeedItem] = []
         var updatedConditionals: [String: FeedConditional] = [:]
+        /// guid -> the real publish time the feed now carries for an ALREADY-COMPILED article whose
+        /// stored date is a guess (see `survey`); applied in Phase C.
+        var dateCorrections: [String: Date] = [:]
         var stats: SourceRunStats
     }
 
@@ -190,7 +226,8 @@ final class EditionCompiler {
     /// exclude patterns/prefixes, in-run guid dedupe, already-stored guid skip, rejected-URL
     /// skip -- plus the edition's own window cutoff (`publishedAt ?? now` within the last 48h,
     /// the same nil-coercion the app applies at store time).
-    private func survey(source: SourceConfig, knownGUIDs: Set<String>, rejectedURLStrings: Set<String>,
+    private func survey(source: SourceConfig, knownGUIDs: Set<String>, retainedDates: [String: CompiledArticle],
+                        rejectedURLStrings: Set<String>,
                         conditionals: [String: FeedConditional], now: Date) async -> SourceSurveyResult {
         var result = SourceSurveyResult(source: source, stats: SourceRunStats(sourceID: source.id))
         var processedGUIDs = Set<String>()
@@ -216,7 +253,18 @@ final class EditionCompiler {
                     if source.excludeURLPatterns.contains(where: { item.url.path.contains($0) }) { continue }
                     if source.excludeTitlePrefixes.contains(where: { item.title.lowercased().hasPrefix($0.lowercased()) }) { continue }
                     if processedGUIDs.contains(item.guid) { continue }
-                    if knownGUIDs.contains(item.guid) { continue }
+                    if knownGUIDs.contains(item.guid) {
+                        // Already compiled -- never re-fetched. But if its stored date is a guess (or
+                        // unknown: compiled before `dateIsEstimated` existed) and the feed now carries a
+                        // real date that is EARLIER by more than a minute, remember the correction. Only an
+                        // earlier date qualifies: a first-seen stamp is always later than the real publish
+                        // time, whereas a feed that merely bumps its pubDate on an update moves it later.
+                        if let real = item.publishedAt, let stored = retainedDates[item.guid],
+                           stored.dateIsEstimated != false, real < stored.publishedAt.addingTimeInterval(-60) {
+                            result.dateCorrections[item.guid] = real
+                        }
+                        continue
+                    }
                     if rejectedURLStrings.contains(item.url.absoluteString) {
                         result.stats.skippedPreviouslyRejected += 1
                         continue
@@ -251,19 +299,29 @@ final class EditionCompiler {
         /// The survey's updated feed conditionals, committed to state together with this
         /// source's articles (finding 3a -- see run()'s Phase A note).
         var updatedConditionals: [String: FeedConditional] = [:]
+        /// Carried over from the survey (see `SourceSurveyResult.dateCorrections`).
+        var dateCorrections: [String: Date] = [:]
         var stats: SourceRunStats
     }
+
+    /// Feed-text sources whose feed carries only a small lead photo while the article page publishes a
+    /// much wider rendition of the SAME photo (measured 2026-10-11): Sun-Times and WBEZ 840 px -> 1486,
+    /// ProPublica 1149 -> 1536, Block Club 1024 -> 1536. Everything else stays exactly as it was: the
+    /// other feed-text sources' pages offer no larger rendition of their feed photo, and page-extract
+    /// sources already take the page's own image. See `ContentExtractor.upgradingHero`.
+    static let pageHeroUpgradeSourceIDs: Set<String> = ["suntimes", "wbez", "propublica", "blockclub"]
 
     private func download(survey: SourceSurveyResult, imagesDir: URL, now: Date) async -> SourceDownloadResult {
         // Finding 3c: a capped source commits NO conditionals -- committing one would 304 the
         // next run straight past the eligible items this run left behind.
         var result = SourceDownloadResult(updatedConditionals: survey.stats.hitItemCap
                                               ? [:] : survey.updatedConditionals,
+                                          dateCorrections: survey.dateCorrections,
                                           stats: survey.stats)
         let source = survey.source
 
         for item in survey.eligibleItems {
-            let extracted: ExtractedArticle
+            var extracted: ExtractedArticle
             do {
                 switch source.strategy {
                 case .feedFullText:
@@ -314,6 +372,60 @@ final class EditionCompiler {
                 continue
             }
 
+            // Feed-text sources whose FEED carries only a small rendition of the lead photo: look the same
+            // photo up on the article page and take the wider rendition the page publishes. Only for
+            // articles that already passed the gate (no page is fetched for a rejected one), pages one at
+            // a time inside the source's own loop (same politeness as page-extract sources), and any
+            // failure keeps the feed's hero -- never fails the article.
+            //
+            // The same fetch also serves the DATE: a feed-text item whose feed carries no usable date
+            // takes the page's own `datePublished` (below), so a source needing both costs ONE request;
+            // a feed-text source that needs only the date (rare: an undated feed item) costs one.
+            let wantsHeroUpgrade = source.strategy == .feedFullText
+                && Self.pageHeroUpgradeSourceIDs.contains(source.id) && extracted.heroImageURL != nil
+            let wantsPageDate = source.strategy == .feedFullText && item.publishedAt == nil
+            var pagePublishedAt = extracted.publishedAt   // page-extract sources: read by the extractor already
+            if wantsHeroUpgrade || wantsPageDate {
+                do {
+                    let page = try await client.get(item.url, maxBytes: FetchLimits.pageBytes)
+                    let pageHTML = String(decoding: page.data, as: UTF8.self)
+                    if wantsHeroUpgrade,
+                       let upgraded = ContentExtractor.upgradingHero(of: extracted, fromPageHTML: pageHTML,
+                                                                    pageURL: item.url) {
+                        extracted = upgraded
+                        result.stats.heroUpgrades += 1
+                    }
+                    if wantsPageDate { pagePublishedAt = ContentExtractor.pagePublishedAt(inPageHTML: pageHTML) }
+                } catch {
+                    DiagnosticsLog.shared.log(.warn, source: source.id,
+                                              "page fetch failed for \(item.guid) (hero upgrade / date lookup skipped): \(error)")
+                }
+            }
+
+            // The article's date: the feed item's own, else the page's ORIGINAL publish time, and only
+            // when neither exists the compile time -- flagged `dateIsEstimated` so downstream code can tell
+            // it is a guess (and counted per source in the run report).
+            let publishedAt: Date
+            let dateIsEstimated: Bool
+            if let feedDate = item.publishedAt {
+                (publishedAt, dateIsEstimated) = (feedDate, false)
+            } else if let pageDate = pagePublishedAt {
+                (publishedAt, dateIsEstimated) = (pageDate, false)
+                result.stats.datesFromPage += 1
+                if pageDate < now.addingTimeInterval(-config.windowSeconds) {
+                    // The page shows this undated feed item is older than the window: it never belonged
+                    // in the edition. Negative-cache it so its page is not fetched again every run.
+                    result.stats.staleByPageDate += 1
+                    result.rejectedURLs.append(item.url)
+                    continue
+                }
+            } else {
+                (publishedAt, dateIsEstimated) = (now, true)
+                result.stats.datesEstimated += 1
+                DiagnosticsLog.shared.log(.warn, source: source.id,
+                                          "no real publish date for \(item.guid) -- stamped with the compile time")
+            }
+
             let bodyBlocksJSON: String
             do {
                 bodyBlocksJSON = try BodyBlockJSON.encode(extracted.bodyBlocks)
@@ -349,7 +461,8 @@ final class EditionCompiler {
                 title: extracted.title,
                 author: extracted.author,
                 attribution: attribution,
-                publishedAt: item.publishedAt ?? now,
+                publishedAt: publishedAt,
+                dateIsEstimated: dateIsEstimated,
                 bodyBlocksJSON: bodyBlocksJSON,
                 imageSHA16: imageSHA16,
                 imageSourceURL: extracted.heroImageURL?.absoluteString
@@ -428,7 +541,9 @@ final class EditionCompiler {
                     publishedAt: EditionDates.string(from: article.publishedAt),
                     bodyBlocksJSON: article.bodyBlocksJSON,
                     topImageURL: article.imageSHA16.map { "\(base)/images/\($0).jpg" },
-                    attribution: article.attribution
+                    attribution: article.attribution,
+                    // Only a GUESSED date is flagged; a real (or legacy/unknown) one omits the key.
+                    dateIsEstimated: article.dateIsEstimated == true ? true : nil
                 )
             }
         )

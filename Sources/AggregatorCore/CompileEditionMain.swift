@@ -142,10 +142,22 @@ public enum CompileEditionMain {
             if source.feedsNotModified > 0 { parts.append("\(source.feedsNotModified) feeds 304") }
             if source.feedErrors > 0 { parts.append("\(source.feedErrors) feed errors") }
             if source.imageFailures > 0 { parts.append("\(source.imageFailures) image failures") }
+            if source.heroUpgrades > 0 { parts.append("\(source.heroUpgrades) heroes upgraded from the page") }
+            if source.datesFromPage > 0 { parts.append("\(source.datesFromPage) dates taken from the page") }
+            if source.datesEstimated > 0 { parts.append("\(source.datesEstimated) DATES ESTIMATED (no real publish time found)") }
+            if source.datesCorrected > 0 { parts.append("\(source.datesCorrected) stored dates corrected") }
+            if source.staleByPageDate > 0 { parts.append("\(source.staleByPageDate) skipped (page date older than the window)") }
             if source.hitItemCap { parts.append("item cap hit (remainder drains next run)") }
             lines.append("  \(source.sourceID): " + parts.joined(separator: ", "))
         }
         lines.append("articles: \(stats.totalArticles) total (\(stats.newArticles) new + \(stats.retainedArticles) retained)")
+        // One line, always: how many NEW articles this run could not date from the feed or the page.
+        let estimated = stats.perSource.filter { $0.datesEstimated > 0 }
+            .sorted { $0.sourceID < $1.sourceID }.map { "\($0.sourceID)=\($0.datesEstimated)" }
+        lines.append("dates: \(stats.perSource.reduce(0) { $0 + $1.datesEstimated }) estimated this run"
+                     + (estimated.isEmpty ? "" : " (" + estimated.joined(separator: ", ") + ")")
+                     + "; \(stats.perSource.reduce(0) { $0 + $1.datesFromPage }) taken from the page"
+                     + "; \(stats.perSource.reduce(0) { $0 + $1.datesCorrected }) stored dates corrected")
         lines.append(String(format: "edition.json.gz: %.2f MB (%d bytes)",
                             Double(stats.gzippedBytes) / 1_048_576, stats.gzippedBytes))
         lines.append(String(format: "images: %d files, %.2f MB (%d pruned this run)",

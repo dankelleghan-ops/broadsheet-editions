@@ -39,12 +39,49 @@ may change it unilaterally.
                                // means what JSONDecoder consumes, not byte order)
     "topImageURL":    String?  // absolute URL into <base>/images/
     "attribution":    String?  // the v1.8 Conversation credit line when applicable
+    "dateIsEstimated": Bool?   // ADDITIVE (2026-10-12): true ONLY when no real publish time could be found and
+                               // publishedAt is the compiler's first-seen time; key omitted otherwise. Old app
+                               // builds ignore it.
   }
   ```
 - Server-side responsibilities: feed parse, full-text extraction, ArticleGate pass/fail,
   LanguageFilter, image download+resize (longest edge 1400px, JPEG q0.72, opaque) named by
   content sha. Phone-side (all EXISTING code paths, unchanged): categorization, subtopics,
   lean, ranking, editor scoring, per-day caps, dedup by guid.
+- Hero choice (vendored `ContentExtractor`): the page's og:image, EXCEPT when its URL carries a
+  logo/text-stamping parameter (`overlay-*`, `watermark*`, imgix `txt*`/`mark*`/`blend*` -- every
+  Guardian og:image is a signed 1200x630 crop with "The Guardian" burned in). Then the page's own
+  lead photo is used (widest page-offered JPEG/PNG rendition; Guardian: 1400 px), else the first
+  body photo, which leaves the body so it isn't shown twice; else the og:image stays. The
+  compiler downloads and re-hosts whatever the extractor chose. Articles already compiled keep
+  their old hero until they age out of the 48 h window (state is never re-fetched).
+- Publish dates (2026-10-12): an article's `publishedAt` is the feed item's original publish time; when
+  the feed has none, the PAGE's own `datePublished` / `article:published_time` (never a "modified" time);
+  only when neither exists the compile time, flagged `dateIsEstimated` and counted per source in the run
+  report ("dates: N estimated this run"). The vendored `FeedParser` now reads RFC 822 variants, ISO 8601
+  with fractional seconds or `+0500` offsets (Sun-Times, WBEZ), `dc:date`, and zone-less stamps ONLY for a
+  feed that declares its zone (`FeedEndpoint.zonelessDatesTimeZone`; NBC 5 = America/Chicago). Undated
+  feed-text items reuse the one page fetch the hero upgrade already makes. A page date older than the
+  window skips the item (negative-cached). Articles compiled BEFORE this change keep their stored date
+  unless the feed still lists them with a real date that is EARLIER by more than a minute: then
+  `publishedAt` is corrected in place (same guid, never re-fetched or duplicated) and the article leaves
+  the edition if its real date is outside the window. Real-dated articles are never rewritten.
+- Feed titles (vendored `FeedParser`): inline tags are stripped, entities decoded (named, decimal, hex,
+  in one pass) and whitespace collapsed at parse time; article bodies are never touched.
+- Feed parsing (vendored `FeedParser`): raw markup nested inside `<content>` / `<content:encoded>`
+  is kept, serialized back into the content HTML. Sun-Times and WBEZ put their lead photo there as an
+  unescaped `<img/>` before the escaped story text; it used to be dropped, leaving 45 of 54 Sun-Times
+  and 8 of 19 WBEZ items with no hero (the rest with a 490x275 photo from mid-body). CDATA and fully
+  escaped feeds are byte-identical to before.
+- Feed-text hero upgrade: Sun-Times, WBEZ, ProPublica and Block Club (`EditionCompiler.
+  pageHeroUpgradeSourceIDs`) carry only a small lead photo in the FEED (840 / 840 / 1149 / 1024 px).
+  After an article passes the gate, the compiler fetches its page (one at a time inside the source's
+  loop, like a page-extract source) and `ContentExtractor.upgradingHero` swaps in the widest rendition
+  of the SAME photograph the page publishes (`<img>`/`<picture>` srcsets and schema.org `ImageObject`
+  entries): smallest one that reaches 1400 px, never a 3200+ px camera original, never a different
+  crop (aspect must match), never a different photo (identity check on the asset id / `url=` source).
+  The feed's own copy of the lead leaves the body. A failed page fetch keeps the feed hero; the run
+  report counts "heroes upgraded from the page". Every other source is untouched.
 - Articles: last 48h, all catalog sources, gate-passing only. Bundle stays under ~8MB gzipped
   (text only; images separate).
 
@@ -108,12 +145,14 @@ swift run -c release compile-edition \
 ## Tests
 
 ```sh
-cd aggregator && swift test   # 60 tests, no live network
+cd aggregator && swift test   # 81 tests, no live network
 ```
 
 Contract shape (golden round-trips, app-encoder-shape bodyBlocksJSON), vendored gate/language
 parity spot-checks, extractor runs against the app suite's own fixtures
-(`BroadsheetTests/Fixtures`), end-to-end compiles against a fake HTTP client (steady-state
+(`BroadsheetTests/Fixtures`), the logo-stamped hero fix (real Guardian fixtures through the
+vendored extractor and through the compiler: the stamped share card is never downloaded, the
+lead photo is; a clean og:image is untouched), end-to-end compiles against a fake HTTP client (steady-state
 304s, negative-cache skips, windowing, image-failure text-first tolerance), pruning, resize
 command builders (including the sips no-upscale guard), SHA-256 NIST vectors, drift
 detection, and the total-loss hardening (mid-run state checkpoints observed on disk, a
