@@ -145,7 +145,7 @@ swift run -c release compile-edition \
 ## Tests
 
 ```sh
-cd aggregator && swift test   # 81 tests, no live network
+cd aggregator && swift test   # 88 tests, no live network
 ```
 
 Contract shape (golden round-trips, app-encoder-shape bodyBlocksJSON), vendored gate/language

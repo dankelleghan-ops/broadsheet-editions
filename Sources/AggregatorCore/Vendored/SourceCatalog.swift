@@ -81,7 +81,17 @@ enum SourceCatalog {
             bodySelector: "article",
             excludeURLPatterns: ["/av/", "/videos/"],
             maxPerDay: 40,
-            decayHalfLifeHours: standardDecayHours
+            decayHalfLifeHours: standardDecayHours,
+            // 2026-10-12: the `article` container also holds two recirculation blocks after the
+            // last paragraph, found in the edition's stored bodies and confirmed on pages fetched
+            // with the compiler's own user agent. (1) `[data-testid=topic-list]`: the "Related
+            // topics" heading (all 57 BBC bodies; the topic links are list items and never became
+            // blocks, so only the heading leaked). (2) `[data-block=promoList]`: other stories'
+            // headlines and photos under "More on this story" (40 bodies) and the "BBC Africa
+            // podcasts" module (4 bodies) -- BBC wraps both in the same promoList block. A third
+            // block type, `[data-block=links]` ("More stories from South Africa:"), is deliberately
+            // NOT stripped here; it needs its own look.
+            junkSelectors: ["[data-testid=topic-list]", "[data-block=promoList]"]
         ),
         SourceConfig(
             id: "pbs",
@@ -163,7 +173,19 @@ enum SourceCatalog {
             // nyc-economic-development-czar/) renders a whole `.single__inline-module` subtree
             // -- a fake <h3> "heading" plus a promo <p> -- that a plain paragraph-text filter
             // alone can't fully catch.
-            junkSelectors: [".inline-module"]
+            //
+            // 2026-10-12: the feed also carries decider.com and pagesix.com pages. Those have no
+            // `.single__content`, so the extractor falls back to the largest paragraph cluster, which
+            // keeps the page's own furniture: `.sharedaddy` (the "Share this:" bar),
+            // `.google-preferred-sources` (the "See more of our coverage in your search results"
+            // button text), `#reelgood-inline` (the "Where to Stream:" widget, with streaming-service
+            // logos) and `.more-on` (a "More On:" list of other stories' headlines). 12 of 24 blocks
+            // in a typical Decider recap were these. On nypost.com pages
+            // `h2.wp-block-heading:has(a[href*=why-trust-post-wanted])` removes only the "Why you
+            // should trust 'Post Wanted'" disclosure heading (it links to the trust page); the
+            // paragraph under it, the article's byline, stays.
+            junkSelectors: [".inline-module", "#reelgood-inline", ".more-on", ".sharedaddy", ".google-preferred-sources",
+                            "h2.wp-block-heading:has(a[href*=why-trust-post-wanted])"]
         ),
         SourceConfig(
             id: "politico",
@@ -272,6 +294,19 @@ enum SourceCatalog {
             excludeURLPatterns: [],
             maxPerDay: 40,
             decayHalfLifeHours: fastDecayHours,
+            // 2026-10-12: the same Prism "collection" widget abcnews strips (see below). In some ABC7
+            // page responses it sits INSIDE the article body, between paragraphs, as
+            // `<section class="MobileContentPromo" data-testid="prism-collection">`: a "Top Stories"
+            // <h2> plus 3 cards, each a thumbnail and the <h2> headline of an unrelated story. 19 of
+            // the 34 ABC7 articles in that day's edition carried it. The sidebar and footer
+            // collections on the same pages are outside the body container and unaffected.
+            //
+            // Also 2026-10-12: `h3:has(a[href*=/watch/live/])` removes an editor-embedded heading
+            // that promotes the station's 24/7 live stream ("ABC7 Chicago is now streaming 24/7.
+            // Click here to watch"), an <h3> wrapping a link to /watch/live/ in the middle of the
+            // text (8 stored bodies). Only a heading that is itself a link to the live-stream page
+            // matches; other headings and links are untouched.
+            junkSelectors: ["[data-testid=prism-collection]", "h3:has(a[href*=/watch/live/])"],
             // v1.4 fix round 1 (Important 2): abc7 is BOTH a Chicago TV affiliate (with nbc5)
             // AND an ABC owned-and-operated station (with abcnews) -- `marketGroups` is now a
             // `Set`, so both memberships are represented directly instead of forcing a pick
@@ -512,7 +547,12 @@ enum SourceCatalog {
             bodySelector: ".duet--layout--entry-body",
             excludeURLPatterns: [],
             maxPerDay: 40,
-            decayHalfLifeHours: standardDecayHours
+            decayHalfLifeHours: standardDecayHours,
+            // 2026-10-12: Vox drops a "Related" module (an <h3> plus a one-link list pointing at
+            // another Vox story, `.duet--article--related`) between paragraphs of the body; 4 stored
+            // bodies carried the stray "Related" heading. The class uses Vox's stable "duet--"
+            // design-system naming, like the body selector above, not a build-hashed name.
+            junkSelectors: [".duet--article--related"]
         ),
         SourceConfig(
             id: "slate",

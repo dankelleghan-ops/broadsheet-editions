@@ -378,6 +378,62 @@ final class ContentExtractor {
         return Array(blocks[0..<cutIndex])
     }
 
+    // MARK: - Mid-body teaser run (defense in depth behind the per-source junk selectors)
+    //
+    // A "teaser run" is what a recirculation carousel leaves behind when its markup survives
+    // extraction: an optional label heading ("Top Stories", "For Subscribers") followed by 3 or
+    // more consecutive PAIRS of (1-2 uncaptioned images, then one heading), with no paragraph
+    // anywhere in between. Real prose never looks like this -- an article's own photos carry a
+    // caption, and its headings are followed by text. trimTrailingChromeRun above only catches
+    // such a run when it is the very END of the body; this catches it in the middle.
+    //
+    // Measured on all 1,259 article bodies of the 2026-10-12 edition (23 sources): it changes
+    // exactly 23 articles -- 19 ABC7 (the "Top Stories" widget) and 4 NBC News (a 30-headline
+    // "For Subscribers" carousel, ~90 junk blocks each) -- removes no paragraph anywhere, and
+    // leaves the other 1,236 bodies byte-identical. Block Club's neighborhood sections (captioned
+    // photos), the NY Post listicles ("Pros:" / "Cons:" headings) and Al Jazeera's question
+    // headings all stay. The per-source selector remains the real fix; this only keeps a widget
+    // that changes its class name from reaching a reader.
+    private static let teaserRunMinimumPairs = 3
+    private static let teaserPairMaxImages = 2
+
+    /// If a teaser pair (images, then one heading) starts at `start`, returns the index just
+    /// past its heading.
+    private static func endOfTeaserPair(in blocks: [BodyBlock], from start: Int) -> Int? {
+        var cursor = start
+        var images = 0
+        while cursor < blocks.count, images < teaserPairMaxImages, blocks[cursor].kind == .image,
+              (blocks[cursor].caption ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            cursor += 1
+            images += 1
+        }
+        guard images >= 1, cursor < blocks.count, blocks[cursor].kind == .heading else { return nil }
+        return cursor + 1
+    }
+
+    /// Internal (not fileprivate) so the unit tests can feed it block lists directly.
+    static func dropTeaserRuns(_ blocks: [BodyBlock]) -> [BodyBlock] {
+        var kept: [BodyBlock] = []
+        var index = 0
+        while index < blocks.count {
+            var cursor = index
+            var pairs = 0
+            while let next = endOfTeaserPair(in: blocks, from: cursor) {
+                pairs += 1
+                cursor = next
+            }
+            if pairs >= teaserRunMinimumPairs {
+                // The module's own label heading sits directly in front of its first teaser.
+                if kept.last?.kind == .heading { kept.removeLast() }
+                index = cursor
+            } else {
+                kept.append(blocks[index])
+                index += 1
+            }
+        }
+        return kept
+    }
+
     // MARK: - Assembly: hero + deduped allImageURLs
 
     fileprivate static func buildArticle(title: String, blocks rawBlocks: [BodyBlock], ogImageURL: URL?,
@@ -388,7 +444,9 @@ final class ContentExtractor {
         // `rawBlocks` -- so an uncaptioned image that fix C trims off the tail is already gone
         // by the time image assembly runs. It correctly never lingers in allImageURLs (and can
         // never become the hero either, since `firstImageURL` below also reads `blocks`).
-        let blocks = trimTrailingChromeRun(rawBlocks)
+        // A mid-body teaser run goes first, so its thumbnails can never become the hero or reach
+        // allImageURLs either.
+        let blocks = trimTrailingChromeRun(dropTeaserRuns(rawBlocks))
         let firstImageURL = blocks.first(where: { $0.kind == .image })
             .flatMap { $0.imageURLString }
             .flatMap { URL(string: $0) }
