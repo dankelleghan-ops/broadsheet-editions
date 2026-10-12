@@ -10,6 +10,7 @@ final class VendoredSourceDriftTests: XCTestCase {
     static let sharedSourcePaths = [
         "Broadsheet/Sources/SourceCatalog.swift",
         "Broadsheet/Pipeline/FeedParser.swift",
+        "Broadsheet/Pipeline/HTMLEntityTable.swift",
         "Broadsheet/Pipeline/ContentExtractor.swift",
         "Broadsheet/Pipeline/ArticleGate.swift",
         "Broadsheet/Pipeline/LanguageFilter.swift",

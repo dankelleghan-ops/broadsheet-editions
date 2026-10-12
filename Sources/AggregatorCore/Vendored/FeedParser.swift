@@ -264,9 +264,9 @@ private final class FeedXMLDelegate: NSObject, XMLParserDelegate {
         case "dc:date":
             dcDateString = text
         case "description":
-            summary = decodeHTMLEntities(text)
+            summary = FeedText.cleanField(text)
         case "summary":
-            if isAtom { summary = decodeHTMLEntities(text) }
+            if isAtom { summary = FeedText.cleanField(text) }
         case "content:encoded":
             contentHTML = text
             inContentElement = false
@@ -277,14 +277,14 @@ private final class FeedXMLDelegate: NSObject, XMLParserDelegate {
             if !isAtom, !text.isEmpty { categories.append(text) }
         case "name":
             // v1.8: Atom <author><name> -- see the `authorName` doc comment above.
-            if inAuthorTag { authorName = decodeHTMLEntities(text) }
+            if inAuthorTag { authorName = FeedText.cleanField(text) }
         case "author":
             if isAtom { inAuthorTag = false }
         case "dc:creator":
             // v1.8: RSS's namespaced creator element -- appears literally as "dc:creator" here
             // because `shouldProcessNamespaces` is false (same convention "media:content" and
             // "content:encoded" already rely on above).
-            authorName = decodeHTMLEntities(text)
+            authorName = FeedText.cleanField(text)
         default:
             break
         }
@@ -316,25 +316,18 @@ private final class FeedXMLDelegate: NSObject, XMLParserDelegate {
 
 /// Entity decoding in ONE pass (each `&...;` is replaced once and never re-scanned), so a
 /// double-escaped `&amp;lt;` becomes the text `&lt;`, not a `<`. The previous implementation replaced
-/// the named entities in dictionary order, which made that outcome depend on hash order. Unknown
-/// or invalid entities are left exactly as written.
+/// the named entities in dictionary order, which made that outcome depend on hash order.
+///
+/// Decimal (`&#241;`) and hex (`&#xF1;`) references decode when they name a real Unicode scalar; every
+/// NAMED reference in the HTML standard that ends with a semicolon decodes too (`HTMLEntityTable`:
+/// `&Ntilde;`, `&ecirc;`, `&szlig;`, `&NotEqualTilde;` ...). Everything else is left EXACTLY as written:
+/// an unknown name (`&notanentity;`, the `AT&T;` of a company name), a malformed sequence (`R&D`, a bare
+/// `&`, `&amp` with no semicolon), zero, a surrogate, and a number past U+10FFFF.
+///
+/// `&nbsp;` is a plain space, as this decoder has always defined it (the standard says U+00A0; the numeric
+/// `&#160;` still gives the no-break space). A headline reads the same either way.
 private func decodeHTMLEntities(_ string: String) -> String {
-    guard string.contains("&") else { return string }
-    let named: [String: String] = [
-        "amp": "&", "lt": "<", "gt": ">", "quot": "\"", "apos": "'", "nbsp": " ",
-        "mdash": "\u{2014}", "ndash": "\u{2013}", "rsquo": "\u{2019}", "lsquo": "\u{2018}",
-        "rdquo": "\u{201D}", "ldquo": "\u{201C}", "hellip": "\u{2026}", "bull": "\u{2022}",
-        "middot": "\u{00B7}", "trade": "\u{2122}", "copy": "\u{00A9}", "reg": "\u{00AE}",
-        "deg": "\u{00B0}", "euro": "\u{20AC}", "pound": "\u{00A3}", "cent": "\u{00A2}", "yen": "\u{00A5}",
-        "sect": "\u{00A7}", "para": "\u{00B6}", "laquo": "\u{00AB}", "raquo": "\u{00BB}",
-        "times": "\u{00D7}", "divide": "\u{00F7}", "frac12": "\u{00BD}", "frac14": "\u{00BC}",
-        "eacute": "\u{00E9}", "egrave": "\u{00E8}", "aacute": "\u{00E1}", "iacute": "\u{00ED}",
-        "oacute": "\u{00F3}", "uacute": "\u{00FA}", "ntilde": "\u{00F1}", "uuml": "\u{00FC}",
-        "ouml": "\u{00F6}", "auml": "\u{00E4}", "ccedil": "\u{00E7}", "Eacute": "\u{00C9}"
-    ]
-    guard let regex = try? NSRegularExpression(pattern: "&(#[0-9]+|#[xX][0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]*);") else {
-        return string
-    }
+    guard string.contains("&"), let regex = EntityPattern.regex else { return string }
     let ns = string as NSString
     var result = ""
     var cursor = 0
@@ -344,16 +337,46 @@ private func decodeHTMLEntities(_ string: String) -> String {
         let body = ns.substring(with: match.range(at: 1))
         var replacement: String?
         if body.hasPrefix("#x") || body.hasPrefix("#X") {
-            replacement = UInt32(body.dropFirst(2), radix: 16).flatMap(Unicode.Scalar.init).map { String(Character($0)) }
+            replacement = numericReference(UInt32(body.dropFirst(2), radix: 16))
         } else if body.hasPrefix("#") {
-            replacement = UInt32(body.dropFirst(1)).flatMap(Unicode.Scalar.init).map { String(Character($0)) }
+            replacement = numericReference(UInt32(body.dropFirst(1)))
+        } else if body == "nbsp" {
+            replacement = " "
         } else {
-            replacement = named[body]
+            replacement = HTMLEntityTable.replacement(for: body)
         }
         result += replacement ?? ns.substring(with: match.range)
     }
     result += ns.substring(from: cursor)
     return result
+}
+
+/// What an entity looks like: `&name;`, `&#123;` or `&#x7B;`. Compiled once.
+private enum EntityPattern {
+    static let regex: NSRegularExpression? = try? NSRegularExpression(
+        pattern: "&(#[0-9]+|#[xX][0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]*);")
+}
+
+/// What the HTML standard says a numeric reference between 0x80 and 0x9F means: the Windows-1252
+/// character at that position, not the C1 control character (old feeds write `&#146;` for an apostrophe and
+/// `&#150;` for an en dash). 0x81, 0x8D, 0x8F, 0x90 and 0x9D have no Windows-1252 character and are not in
+/// the table, so they decode as they always did. Built once.
+private enum NumericReferenceRemap {
+    static let cp1252: [UInt32: UInt32] = [
+        0x80: 0x20AC, 0x82: 0x201A, 0x83: 0x192, 0x84: 0x201E, 0x85: 0x2026, 0x86: 0x2020, 0x87: 0x2021,
+        0x88: 0x2C6, 0x89: 0x2030, 0x8A: 0x160, 0x8B: 0x2039, 0x8C: 0x152, 0x8E: 0x17D, 0x91: 0x2018,
+        0x92: 0x2019, 0x93: 0x201C, 0x94: 0x201D, 0x95: 0x2022, 0x96: 0x2013, 0x97: 0x2014, 0x98: 0x2DC,
+        0x99: 0x2122, 0x9A: 0x161, 0x9B: 0x203A, 0x9C: 0x153, 0x9E: 0x17E, 0x9F: 0x178
+    ]
+}
+
+/// The text for a numeric reference, or nil (leave it as written) when it is not a character: zero, a
+/// surrogate (U+D800-DFFF), above U+10FFFF, or too large to be a number at all. A number in 0x80-0x9F is
+/// read as its Windows-1252 character (`NumericReferenceRemap`).
+private func numericReference(_ value: UInt32?) -> String? {
+    guard let value, value != 0,
+          let scalar = Unicode.Scalar(NumericReferenceRemap.cp1252[value] ?? value) else { return nil }
+    return String(Character(scalar))
 }
 
 /// Text hygiene for FEED-SUPPLIED TITLES (never the article body, which keeps its markup for
@@ -379,6 +402,22 @@ enum FeedText {
         return text
             .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// The single-pass entity decoder, nothing else (no tag stripping, no whitespace work). What the feed
+    /// path applies to a feed's author and summary, and the first step of `cleanTitle`.
+    static func decodeEntities(_ string: String) -> String { decodeHTMLEntities(string) }
+
+    /// Text hygiene for the other feed-supplied fields (author, summary, credit line): decode entities in
+    /// one pass, exactly as the feed parser does. Idempotent on anything that was escaped once; a
+    /// deliberately double-escaped `&amp;amp;` loses one layer per call, by design (see `cleanTitle`, which
+    /// goes up to three passes, for the field where that matters).
+    static func cleanField(_ raw: String) -> String { decodeHTMLEntities(raw) }
+
+    /// True when `string` holds at least one reference that `decodeEntities` would change. A sequence that
+    /// merely looks like one (`AT&T;`, `&notanentity;`, `&#0;`) is false: leaving it alone is the point.
+    static func containsDecodableEntity(_ string: String) -> Bool {
+        string.contains("&") && decodeHTMLEntities(string) != string
     }
 }
 

@@ -66,8 +66,12 @@ may change it unilaterally.
   unless the feed still lists them with a real date that is EARLIER by more than a minute: then
   `publishedAt` is corrected in place (same guid, never re-fetched or duplicated) and the article leaves
   the edition if its real date is outside the window. Real-dated articles are never rewritten.
-- Feed titles (vendored `FeedParser`): inline tags are stripped, entities decoded (named, decimal, hex,
-  in one pass) and whitespace collapsed at parse time; article bodies are never touched.
+- Feed titles (vendored `FeedParser`): inline tags are stripped, entities decoded (every named reference
+  in the HTML standard that ends with a semicolon -- 2,125 names in the generated, also-vendored
+  `HTMLEntityTable.swift`, rebuilt by `scripts/gen_html_entity_table.py` -- plus decimal and hex, in one
+  pass) and whitespace collapsed at parse time; article bodies are never touched. Unknown names and
+  malformed sequences (`AT&T;`, `R&D`, `&#0;`) stay exactly as written. Authors and summaries get the same
+  one-pass decode. The editions repo's copy of the package needs `HTMLEntityTable.swift` too.
 - Feed parsing (vendored `FeedParser`): raw markup nested inside `<content>` / `<content:encoded>`
   is kept, serialized back into the content HTML. Sun-Times and WBEZ put their lead photo there as an
   unescaped `<img/>` before the escaped story text; it used to be dropped, leaving 45 of 54 Sun-Times

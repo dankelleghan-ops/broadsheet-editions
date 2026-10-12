@@ -32,6 +32,7 @@ MANIFEST="$DEST/MANIFEST.sha256"
 FILES=(
   "Broadsheet/Sources/SourceCatalog.swift"
   "Broadsheet/Pipeline/FeedParser.swift"
+  "Broadsheet/Pipeline/HTMLEntityTable.swift"
   "Broadsheet/Pipeline/ContentExtractor.swift"
   "Broadsheet/Pipeline/ArticleGate.swift"
   "Broadsheet/Pipeline/LanguageFilter.swift"
