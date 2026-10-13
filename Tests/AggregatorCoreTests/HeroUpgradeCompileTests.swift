@@ -92,9 +92,10 @@ final class HeroUpgradeCompileTests: XCTestCase {
         XCTAssertEqual(client.requestCount(of: Self.feedHero), 0, "the small feed rendition is never downloaded")
         XCTAssertEqual(edition.articles[0].topImageURL, "https://pages.example/edition/images/\(sha16(of: "PAGEHERO1486")).jpg")
         XCTAssertEqual(stats?.heroUpgrades, 1)
-        // The feed's own copy of the lead left the body, so the photo is shown once.
+        // CHANGED (hero shown once): the feed's own copy of the lead no longer LEAVES the body. It stays, marked
+        // `repeatsHero`, so the reader draws the photo once (as the hero) and the block's caption/credit survive.
         let blocks = try JSONDecoder().decode([BodyBlock].self, from: Data(edition.articles[0].bodyBlocksJSON.utf8))
-        XCTAssertEqual(blocks.filter { $0.kind == .image }.count, 0)
+        XCTAssertEqual(blocks.filter { $0.kind == .image }.map(\.repeatsHero), [true])
         XCTAssertEqual(blocks.filter { $0.kind == .paragraph }.count, 3)
     }
 
@@ -110,6 +111,8 @@ final class HeroUpgradeCompileTests: XCTestCase {
         XCTAssertEqual(stats?.heroUpgrades, 0)
         let blocks = try JSONDecoder().decode([BodyBlock].self, from: Data(edition.articles[0].bodyBlocksJSON.utf8))
         XCTAssertEqual(blocks.filter { $0.kind == .image }.count, 1, "the lead stays in the body exactly as before")
+        XCTAssertEqual(blocks.filter { $0.kind == .image }.first?.repeatsHero, true,
+                       "and, being the hero (the first body image of a feed-text article), it is marked as the hero's repeat")
     }
 
     func testAFailedPageFetchKeepsTheFeedHeroAndNeverFailsTheArticle() async throws {

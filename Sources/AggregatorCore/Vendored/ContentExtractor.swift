@@ -435,8 +435,37 @@ final class ContentExtractor {
     }
 
     // MARK: - Assembly: hero + deduped allImageURLs
+    //
+    // HERO SHOWN ONCE. The reader draws the hero photo at the top of an article AND every image block of the
+    // body, so any article whose hero is also a body image showed the same photograph twice. Measured on the
+    // 2026-10-12 live edition (pixels compared, 306 articles): BBC 29 of 35, NPR 20 of 20, Vox 5 of 5, ABC News
+    // 5 of 8, ABC7 6 of 20, CBS 13 of 20, and every feed-text source whose hero is by construction the first body
+    // image (Reason 17 of 17, Washington Examiner 13 of 13, Sun-Times 5 of 12, Block Club 2 of 12). Nothing in the
+    // pipeline told the reader which block was the hero.
+    //
+    // This is the ONE place that decides it, for all three assembly paths (feed text, page, and `upgradingHero`):
+    // once the hero is chosen, EVERY image block that is the hero's photograph is marked `repeatsHero = true`:
+    //   - the exact same URL string, or
+    //   - `samePhoto(blockURL, hero)` (same asset under another size/crop/host shard), or
+    //   - a block the caller KNOWS is the hero's photo (`heroBlockURLs`): the block a page's lead figure produced,
+    //     which URL identity cannot always prove (BBC's `standard/1024` copy of a photo whose og asset is another
+    //     upload; a Guardian-style figure whose `src` is a different width).
+    // Marked blocks are MARKED, never removed: a marked block is the only place the lead photo's caption and
+    // credit live, and the reader puts them under the hero. Marks are recomputed from scratch on every assembly,
+    // so a block never carries a stale mark from an earlier hero. Marked blocks whose URL differs from the hero's
+    // are left out of `allImageURLs`: the reader will not draw them, so the on-device path must not download them.
+    // What this cannot catch (and deliberately does not chase with image comparison): a publisher that uploaded
+    // one picture twice under unrelated URLs (seen on NY Post and ABC7).
+
+    /// True when `blockURL` shows the hero's photograph (see "HERO SHOWN ONCE" above).
+    private static func isHeroPhoto(_ blockURL: String, hero: URL, knownBlockURLs: Set<String>) -> Bool {
+        if blockURL == hero.absoluteString || knownBlockURLs.contains(blockURL) { return true }
+        guard let url = URL(string: blockURL) else { return false }
+        return samePhoto(url, hero)
+    }
 
     fileprivate static func buildArticle(title: String, blocks rawBlocks: [BodyBlock], ogImageURL: URL?,
+                                          heroBlockURLs: Set<String> = [],
                                           author: String? = nil, authorInstitution: String? = nil,
                                           url: URL? = nil, publishedAt: Date? = nil) -> ExtractedArticle {
         // Cheap minor (fix round 1): trimTrailingChromeRun runs BEFORE hero/allImageURLs are
@@ -446,18 +475,27 @@ final class ContentExtractor {
         // never become the hero either, since `firstImageURL` below also reads `blocks`).
         // A mid-body teaser run goes first, so its thumbnails can never become the hero or reach
         // allImageURLs either.
-        let blocks = trimTrailingChromeRun(dropTeaserRuns(rawBlocks))
+        var blocks = trimTrailingChromeRun(dropTeaserRuns(rawBlocks))
         let firstImageURL = blocks.first(where: { $0.kind == .image })
             .flatMap { $0.imageURLString }
             .flatMap { URL(string: $0) }
         let heroImageURL = ogImageURL ?? firstImageURL
+
+        // Hero shown once: clear every mark first (no stale mark from an earlier hero), then mark afresh.
+        for index in blocks.indices where blocks[index].kind == .image {
+            blocks[index].repeatsHero = nil
+            if let hero = heroImageURL, let s = blocks[index].imageURLString,
+               isHeroPhoto(s, hero: hero, knownBlockURLs: heroBlockURLs) {
+                blocks[index].repeatsHero = true
+            }
+        }
 
         var allImageURLs: [URL] = []
         var seen = Set<String>()
         if let hero = heroImageURL, seen.insert(hero.absoluteString).inserted {
             allImageURLs.append(hero)
         }
-        for block in blocks where block.kind == .image {
+        for block in blocks where block.kind == .image && block.repeatsHero != true {
             if let s = block.imageURLString, let url = URL(string: s), seen.insert(url.absoluteString).inserted {
                 allImageURLs.append(url)
             }
@@ -507,13 +545,15 @@ final class ContentExtractor {
         var ogImageURL = Self.ogImageURL(in: doc, baseURL: articleURL)
 
         // A social image with a logo/text stamp burned in by the publisher's image service is a
-        // share card, not the article's photograph -- prefer the page's own lead photo, else its
-        // first body photo (which then leaves the body so it is not shown twice). See
-        // "Stamped social images" below.
+        // share card, not the article's photograph -- prefer the page's own lead photo, else a
+        // badge-free twin of the same asset where one can be derived, else its first body photo.
+        // See "Stamped social images" below. Whichever block shows the chosen photo is then MARKED
+        // as the hero's repeat by `buildArticle` (never removed).
+        var heroBlockURLs = Set<String>()
         if let og = ogImageURL, Self.isStampedSocialImage(og),
-           let replacement = Self.unstampedHero(in: doc, blocks: blocks, baseURL: articleURL) {
+           let replacement = Self.unstampedHero(in: doc, blocks: blocks, ogURL: og, baseURL: articleURL) {
             ogImageURL = replacement.url
-            blocks = replacement.blocks
+            if let ownBlockURL = replacement.ownBlockURL { heroBlockURLs.insert(ownBlockURL) }
         }
 
         // v1.8 (spec item 1): the page's own byline wins outright when present; the feed's
@@ -537,6 +577,7 @@ final class ContentExtractor {
         }
 
         return Self.buildArticle(title: item.title, blocks: blocks, ogImageURL: ogImageURL,
+                                  heroBlockURLs: heroBlockURLs,
                                   author: author, authorInstitution: authorInstitution, url: articleURL,
                                   publishedAt: pagePublished)
     }
@@ -962,17 +1003,31 @@ final class ContentExtractor {
     // offers the real photograph: its lead figure's <picture> lists signed renditions up to 1400 px
     // wide (`width=700&dpr=2&s=none&crop=none`).
     //
-    // The rule, applied only when the og:image URL carries a stamp parameter (so every other
-    // source -- sampled 2026-10-11, 13 of 14 clean -- behaves exactly as before):
+    // BBC does the same with its PATH instead of a query: every BBC article's og:image is a
+    // `https://ichef.bbci.co.uk/ace/branded_news/1200/cpsprodpb/<4hex>/live/<uuid>.jpg` (or
+    // `branded_sport`), the photo with a "BBC NEWS" / "BBC SPORT" badge burned into a corner
+    // (measured 2026-10-12: 33 of 35 BBC og:images). The same asset without the badge is
+    // `.../ace/standard/1200/...` (verified live: 200 image/jpeg; do NOT change the width, `standard/1400`
+    // is a 404).
+    //
+    // The rule, applied only when the og:image URL carries a stamp (so every other source -- sampled
+    // 2026-10-11, 13 of 14 clean -- behaves exactly as before):
     //   1. the page's lead figure: the first <figure> with a usable image that comes before the
-    //      first real body paragraph, taking its widest page-offered JPEG/PNG rendition;
-    //   2. else the first image block of the extracted body;
-    //   3. else keep the og:image (a branded photo beats no photo).
-    // Whichever photo is promoted to hero is removed from the body's first image block when it is
-    // the same photo, so the reader never shows it twice. Trade-off, stated plainly: a caption or
-    // credit that lived only on that removed block goes with it (the reader's hero has no caption
-    // slot of its own). For Guardian the lead sits outside the body, so nothing is removed and
-    // nothing is lost.
+    //      first real body paragraph, taking its widest page-offered JPEG/PNG rendition. This comes
+    //      first because it also ties the hero to the body: BBC sometimes uploads the og:image as a
+    //      SEPARATE asset of the lead picture (a different uuid; confirmed on a real page 2026-10-12,
+    //      `page-bbc-og-separate-upload`), which no URL comparison could ever match to the body's copy;
+    //   2. else, where a badge-free twin of the og:image can be derived by rule (BBC only:
+    //      `ace/branded_<x>/<w>/...` -> `ace/standard/<w>/...`), that twin. This keeps the editor's
+    //      chosen photo, without the badge, on articles with no lead figure (a video-led story)
+    //      instead of promoting a mid-article map or chart. Guardian's stamp is a signed query
+    //      parameter, so no twin can be derived and it never gets here;
+    //   3. else the first image block of the extracted body;
+    //   4. else keep the og:image (a branded photo beats no photo).
+    // The photo promoted to hero is NOT removed from the body any more: `buildArticle` marks every
+    // body block that shows it (`repeatsHero`), and the reader draws it once, with that block's caption
+    // and credit under the hero. Net effect for Guardian, Sun-Times, WBEZ and Block Club: the same single
+    // photo as before, but the body copy's caption and credit are no longer thrown away.
 
     /// Query-parameter NAMES that ask an image service to burn something onto the picture:
     /// `overlay*` (Guardian/Fastly `overlay-base64`, `overlay-align`, ...), `watermark*`, and the
@@ -981,12 +1036,56 @@ final class ContentExtractor {
     /// cannot trip it.
     private static let stampParameterPattern = "^(overlay.*|watermark.*|(txt|mark|blend)(64|-[a-z0-9]+)?)$"
 
-    /// True when `url` carries a logo/text-stamping query parameter (see above).
+    /// True when `url` carries a logo/text-stamping query parameter, or is a BBC branded rendition (see above).
     static func isStampedSocialImage(_ url: URL) -> Bool {
+        if isBBCBrandedRendition(url) { return true }
         guard let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems else { return false }
         return items.contains {
             $0.name.range(of: stampParameterPattern, options: [.regularExpression, .caseInsensitive]) != nil
         }
+    }
+
+    private static func isBBCHost(_ url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else { return false }
+        return host == "bbci.co.uk" || host.hasSuffix(".bbci.co.uk")
+    }
+
+    /// BBC's badge-stamped share-card renditions: a `bbci.co.uk` host and a WHOLE path segment of the form
+    /// `branded_<letters>` (`branded_news` and `branded_sport` both occur live).
+    private static func isBBCBrandedRendition(_ url: URL) -> Bool {
+        guard isBBCHost(url) else { return false }
+        return url.path.split(separator: "/").contains {
+            $0.range(of: "^branded_[a-z]+$", options: .regularExpression) != nil
+        }
+    }
+
+    /// The same asset without the badge, where that can be derived by RULE: BBC
+    /// `/ace/branded_<x>/<width>/...` -> `/ace/standard/<width>/...` (width kept as it is: `standard/1200` exists,
+    /// `standard/1400` is a 404). nil for everything else, so only BBC ever gets a twin.
+    static func unstampedTwin(of url: URL) -> URL? {
+        guard isBBCHost(url), var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let range = components.path.range(of: "^/ace/branded_[a-z]+/", options: .regularExpression) else { return nil }
+        components.path.replaceSubrange(range, with: "/ace/standard/")
+        return components.url
+    }
+
+    /// The width (pixels) the BBC serves its own share images at: `ace/branded_news/1200/...`.
+    private static let bbcShareWidth = 1200
+
+    /// BBC only: a lead photo's `ace/standard/<w>/` rendition narrower than `bbcShareWidth`, re-requested at that
+    /// width; every other URL comes back unchanged. A BBC page's `srcset` stops at 976 px and its `<img src>` is
+    /// the original (often 3840 px, which `pickRendition` skips as a camera original), so without this the clean
+    /// hero would be narrower than the badged 1200 px card it replaces (measured 2026-10-12: 18 of 26 live BBC
+    /// heroes came out at 777-1024 px). The image service resizes any asset to the widths it supports (verified
+    /// live the same day: 976, 1200, 1536, 1600 and 1920 answer 200, 1400 is a 404); 1200 is the one the BBC
+    /// itself uses for every share image.
+    static func widenedToShareWidth(_ url: URL) -> URL {
+        guard isBBCHost(url), var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let range = components.path.range(of: "^/ace/standard/\\d+/", options: .regularExpression),
+              let width = Int(components.path[range].dropFirst("/ace/standard/".count).dropLast()),
+              width < bbcShareWidth else { return url }
+        components.path.replaceSubrange(range, with: "/ace/standard/\(bbcShareWidth)/")
+        return components.url ?? url
     }
 
     /// A lead photo narrower than this (in pixels, when the page says) is a thumbnail, not a hero.
@@ -1000,35 +1099,30 @@ final class ContentExtractor {
         let width: Int
     }
 
-    /// The replacement hero and the (possibly shortened) body blocks, or nil when the page offers
-    /// no unstamped alternative.
-    private static func unstampedHero(in doc: Document, blocks: [BodyBlock],
-                                      baseURL: URL) -> (url: URL, blocks: [BodyBlock])? {
+    /// The replacement hero, or nil when the page offers no unstamped alternative. `ownBlockURL` is the URL of the
+    /// body block the page's lead figure produced (when the hero came from that figure): the caller marks it as the
+    /// hero's repeat even where URL identity cannot prove it. Nothing is removed from the body.
+    private static func unstampedHero(in doc: Document, blocks: [BodyBlock], ogURL: URL,
+                                      baseURL: URL) -> (url: URL, ownBlockURL: String?)? {
+        // 1. The page's lead figure. It may ALSO be the body's own first image block (it is, wherever the body
+        //    selector encloses the lead -- e.g. BBC's `article`): that block is the one `imageBlock(fromFigure:)`
+        //    builds from this very figure, i.e. the URL `resolveImageURL` reads from its <img>.
         if let lead = leadFigure(in: doc, baseURL: baseURL) {
-            var remaining = blocks
-            // The lead figure may ALSO be the body's first image block (it is, wherever the body
-            // selector encloses the lead -- e.g. BBC's `article`). Remove that block: exact match
-            // on the URL this very figure produces as a block, else the same photo under another
-            // rendition (shared asset id) as the body's FIRST image block only.
             let ownBlockURL = (try? lead.figure.select("img").first())
                 .flatMap { resolveImageURL($0, baseURL: baseURL)?.absoluteString }
-            if let ownBlockURL,
-               let index = remaining.firstIndex(where: { $0.kind == .image && $0.imageURLString == ownBlockURL }) {
-                remaining.remove(at: index)
-            } else if let index = remaining.firstIndex(where: { $0.kind == .image }),
-                      let firstURL = remaining[index].imageURLString.flatMap({ URL(string: $0) }),
-                      samePhoto(firstURL, lead.rendition.url) {
-                remaining.remove(at: index)
-            }
-            return (lead.rendition.url, remaining)
+            return (widenedToShareWidth(lead.rendition.url), ownBlockURL)
         }
-        if let index = blocks.firstIndex(where: {
-            guard $0.kind == .image, let s = $0.imageURLString, let u = URL(string: s) else { return false }
-            return !isStampedSocialImage(u)
-        }), let url = blocks[index].imageURLString.flatMap({ URL(string: $0) }) {
-            var remaining = blocks
-            remaining.remove(at: index)
-            return (url, remaining)
+        // 2. The badge-free twin of the og:image's own asset, where a rule can derive it (BBC only).
+        if let twin = unstampedTwin(of: ogURL) {
+            return (twin, nil)
+        }
+        // 3. The first body photo that is not itself stamped.
+        if let url = blocks.lazy.compactMap({ block -> URL? in
+            guard block.kind == .image, let s = block.imageURLString, let u = URL(string: s),
+                  !isStampedSocialImage(u) else { return nil }
+            return u
+        }).first {
+            return (url, url.absoluteString)
         }
         return nil
     }
@@ -1236,8 +1330,11 @@ final class ContentExtractor {
     /// segment of 24+ characters containing a digit, extension stripped -- Guardian's 40-hex asset
     /// hash, BBC's UUID filename). Renditions of one photo differ only in size/crop segments. For
     /// resizing proxies that carry the original in a `url=` query parameter (Brightspot's `dims4`,
-    /// used by Sun-Times/WBEZ/NPR) the ORIGINAL's host and path are what is compared.
-    private static func samePhoto(_ a: URL, _ b: URL) -> Bool {
+    /// used by Sun-Times/WBEZ/NPR) the ORIGINAL's host and path are what is compared. Shard hosts count as one
+    /// host: CBS serves one photo from `assets1`, `assets2` and `assets3.cbsnewsstatic.com` (the og:image and the
+    /// body copy of one picture routinely land on different shards), so trailing digits are dropped from the host's
+    /// FIRST label before comparing. Internal (not private) so the tests can call it.
+    static func samePhoto(_ a: URL, _ b: URL) -> Bool {
         guard let assetA = canonicalAsset(a), let assetB = canonicalAsset(b), assetA.host == assetB.host else {
             return false
         }
@@ -1249,10 +1346,23 @@ final class ContentExtractor {
         if let embedded = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
             .first(where: { $0.name == "url" })?.value,
            let inner = URL(string: embedded), let innerHost = inner.host {
-            return (innerHost.lowercased(), inner.path)
+            return (shardNormalized(host: innerHost), inner.path)
         }
         guard let host = url.host else { return nil }
-        return (host.lowercased(), url.path)
+        return (shardNormalized(host: host), url.path)
+    }
+
+    /// Lowercased host with trailing digits removed from its FIRST label (`assets3.cbsnewsstatic.com` ->
+    /// `assets.cbsnewsstatic.com`), so shards of one CDN compare equal. A first label that is ALL digits is left
+    /// alone, and so is a host of fewer than three labels (`abc1.com` is a different site from `abc.com`, not a
+    /// shard of it); digits that are not at the end of the label (`cdn2go`) never count.
+    private static func shardNormalized(host: String) -> String {
+        var labels = host.lowercased().split(separator: ".", omittingEmptySubsequences: false).map(String.init)
+        guard labels.count >= 3 else { return host.lowercased() }
+        var first = labels[0]
+        while let last = first.last, last.isNumber { first.removeLast() }
+        if !first.isEmpty { labels[0] = first }
+        return labels.joined(separator: ".")
     }
 
     private static func assetTokens(path: String) -> Set<String> {
@@ -1262,9 +1372,15 @@ final class ContentExtractor {
             while let dot = s.lastIndex(of: "."), s.distance(from: dot, to: s.endIndex) <= 5 {
                 s = String(s[..<dot])
             }
-            // A hash/UUID-like id: long, has a digit, and NO dots (a dotted segment is a host name such
-            // as Jetpack's `bcc-newspack.s3.amazonaws.com`, which every image of a site shares).
-            if s.count >= 24, !s.contains("."), s.contains(where: { $0.isNumber }) { tokens.insert(s) }
+            // A hash/UUID-like id: long, has a digit, and made ONLY of hex digits and dashes (Guardian's 40-hex
+            // asset hash; the UUIDs BBC, CBS and ABC News use). Anything else long is not an id: a dotted segment
+            // is a host name (Jetpack's `bcc-newspack.s3.amazonaws.com`, which every image of a site shares), and
+            // a resizing service's transform segment (Cloudinary's `t_focal-260x130,f_avif,q_auto:best`, shared by
+            // every photo in an NBC News article) would make DIFFERENT photos look like one.
+            if s.count >= 24, s.contains(where: { $0.isNumber }),
+               s.allSatisfy({ $0.isASCII && ($0.isHexDigit || $0 == "-") }) {
+                tokens.insert(s)
+            }
         }
         return tokens
     }
@@ -1284,9 +1400,10 @@ final class ContentExtractor {
 
     /// `article` with its hero swapped for the page's best rendition OF THE SAME PHOTO (every `<img>`/
     /// `<picture>` on the page is searched; see `pickRendition` for the width rule), and only when that
-    /// is wider than the width the current hero URL declares. The body's first image block (the feed's
-    /// own copy of that photo) is dropped so it is not shown twice. nil = nothing to upgrade (no hero,
-    /// the photo isn't on the page, or no gain).
+    /// is wider than the width the current hero URL declares. The body's copy of that photo (the feed's own
+    /// lead block, whose URL IS the current hero) stays in the body, marked `repeatsHero` by `buildArticle` like
+    /// every other repeat of the hero, so it is shown once and its caption/credit are kept. nil = nothing to
+    /// upgrade (no hero, the photo isn't on the page, or no gain).
     static func upgradingHero(of article: ExtractedArticle, fromPageHTML html: String,
                               pageURL: URL) -> ExtractedArticle? {
         guard let currentHero = article.heroImageURL, let doc = try? SwiftSoup.parse(html),
@@ -1309,13 +1426,11 @@ final class ContentExtractor {
         let currentWidth = declaredWidth(inURL: currentHero)
         if currentWidth > 0, best.width <= currentWidth { return nil }
 
-        var blocks = article.bodyBlocks
-        if let index = blocks.firstIndex(where: { $0.kind == .image }),
-           let blockURL = blocks[index].imageURLString.flatMap({ URL(string: $0) }),
-           samePhoto(blockURL, best.url) {
-            blocks.remove(at: index)
-        }
-        return buildArticle(title: article.title, blocks: blocks, ogImageURL: best.url,
+        // The block that IS the old hero is, by construction, a copy of the photograph the new hero is a
+        // rendition of (`best` was chosen by `samePhoto(currentHero, ...)`), so it is a known repeat; every other
+        // block is judged afresh against the new hero (no stale mark survives).
+        return buildArticle(title: article.title, blocks: article.bodyBlocks, ogImageURL: best.url,
+                            heroBlockURLs: [currentHero.absoluteString],
                             author: article.author, authorInstitution: article.authorInstitution,
                             url: article.url, publishedAt: article.publishedAt)
     }

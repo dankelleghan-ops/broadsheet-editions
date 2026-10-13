@@ -91,7 +91,12 @@ enum SourceCatalog {
             // podcasts" module (4 bodies) -- BBC wraps both in the same promoList block. A third
             // block type, `[data-block=links]` ("More stories from South Africa:"), is deliberately
             // NOT stripped here; it needs its own look.
-            junkSelectors: ["[data-testid=topic-list]", "[data-block=promoList]"]
+            // (3) `figcaption .visually-hidden`: BBC puts a screen-reader label inside every figcaption,
+            // `<span class="visually-hidden ...">Image caption, </span>` ("Figure caption, " on video
+            // figures), so 92 of 92 BBC captions in the 2026-10-12 edition began "Image caption, Trump
+            // announced ...". Scoped to figcaptions, so no other hidden text is touched; the credit label
+            // ("Image source, ") sits OUTSIDE the figcaption and is not read at all.
+            junkSelectors: ["[data-testid=topic-list]", "[data-block=promoList]", "figcaption .visually-hidden"]
         ),
         SourceConfig(
             id: "pbs",

@@ -44,17 +44,56 @@ may change it unilaterally.
                                // builds ignore it.
   }
   ```
+- Body block (inside `bodyBlocksJSON`): `{ "kind", "text"?, "imageURLString"?, "caption"?, "credit"?, "repeatsHero"? }`.
+  `repeatsHero` is **ADDITIVE (2026-10-12, "hero shown once")**: `true` ONLY on an image block that shows the SAME
+  photograph as the article's hero image (`topImageURL`); the key is omitted otherwise, so a body with no repeat
+  encodes byte-for-byte as it always did and old app builds ignore the key. The block stays in the body (it is
+  the only place the lead photo's caption and credit live); new app builds draw the photo once, as the hero, with
+  that block's caption and credit under it, and do not draw (or download) the marked block itself -- unless the
+  article ended up with no stored hero, when the block is drawn as usual. A body can carry more than one marked
+  block (Vox puts the same photo at the top twice). See "Hero shown once" below.
 - Server-side responsibilities: feed parse, full-text extraction, ArticleGate pass/fail,
   LanguageFilter, image download+resize (longest edge 1400px, JPEG q0.72, opaque) named by
   content sha. Phone-side (all EXISTING code paths, unchanged): categorization, subtopics,
   lean, ranking, editor scoring, per-day caps, dedup by guid.
-- Hero choice (vendored `ContentExtractor`): the page's og:image, EXCEPT when its URL carries a
-  logo/text-stamping parameter (`overlay-*`, `watermark*`, imgix `txt*`/`mark*`/`blend*` -- every
-  Guardian og:image is a signed 1200x630 crop with "The Guardian" burned in). Then the page's own
-  lead photo is used (widest page-offered JPEG/PNG rendition; Guardian: 1400 px), else the first
-  body photo, which leaves the body so it isn't shown twice; else the og:image stays. The
-  compiler downloads and re-hosts whatever the extractor chose. Articles already compiled keep
+- Hero choice (vendored `ContentExtractor`): the page's og:image, EXCEPT when it is a STAMPED share card: its URL
+  carries a logo/text-stamping parameter (`overlay-*`, `watermark*`, imgix `txt*`/`mark*`/`blend*` -- every
+  Guardian og:image is a signed 1200x630 crop with "The Guardian" burned in), or it is a BBC branded rendition
+  (a `bbci.co.uk` URL with a whole path segment `branded_<letters>`: `ace/branded_news/1200/...` and
+  `ace/branded_sport/1200/...` carry a "BBC NEWS"/"BBC SPORT" badge; 33 of 35 BBC og:images measured
+  2026-10-12). For a stamped og:image the order is:
+  1. the page's lead figure (the first usable `<figure>` before the first real body paragraph), taking its widest
+     page-offered JPEG/PNG rendition (Guardian: 1400 px). First because it also ties the hero to the body: BBC
+     sometimes uploads the og:image as a SEPARATE asset of the lead picture (a different uuid; confirmed on a real
+     page 2026-10-12), which no URL comparison could match to the body's copy;
+  2. else, where a badge-free twin can be derived by rule, that twin: BBC `.../ace/branded_<x>/<width>/...` ->
+     `.../ace/standard/<width>/...` (verified live 2026-10-12: `standard/1200` answers 200 image/jpeg; the width is
+     kept -- `standard/1400` is a 404). This keeps the editor's chosen photo, without the badge, on articles with
+     no lead figure (a video-led story) instead of promoting a mid-article map or chart. Guardian's stamp is a
+     signed query parameter, so no twin can be derived and its behavior is unchanged;
+  3. else the first body photo; 4. else the og:image stays.
+  The compiler downloads and re-hosts whatever the extractor chose. Articles already compiled keep
   their old hero until they age out of the 48 h window (state is never re-fetched).
+- Hero shown once (2026-10-12): the reader draws the hero AND every body image, so wherever the hero photograph is
+  also a body image it appeared twice (measured by comparing pixels on the live edition: BBC 29 of 35 articles,
+  NPR 20 of 20, Vox 5 of 5, ABC News 5 of 8, ABC7 6 of 20, CBS 13 of 20 -- the repeat is a LATER block in 4 of
+  them -- and every feed-text source, whose hero IS the first body image: Reason 17 of 17, Examiner 13 of 13).
+  One rule in one place, `ContentExtractor.buildArticle` (the assembly point of the feed path, the page path and
+  `upgradingHero`): after the hero is chosen, EVERY image block that shows the hero's photograph gets
+  `repeatsHero = true` (see the contract above) and STAYS in the body. A block counts when its URL is exactly the
+  hero's, when `samePhoto` says so (same host and same path, or a shared long asset id such as a UUID folder or a
+  40-hex Guardian hash; for resizing proxies the `url=` original is compared; **hosts that differ only by
+  trailing digits on their first label, `assets1`/`assets2`/`assets3.cbsnewsstatic.com`, are one host**), or when
+  it is the block the page's lead figure produced (known by construction, so BBC's `standard/1024` copy of a
+  photo whose og asset is another upload is still caught). Marks are recomputed from scratch on every assembly: a
+  block never keeps a stale mark when the hero changes. Marked blocks whose URL differs from the hero's are left
+  out of `allImageURLs` (the on-device crawl does not download a picture the reader will not draw). It does NOT
+  catch a publisher that uploaded one picture twice under unrelated URLs (seen on NY Post and ABC7); that would
+  need image comparison and is deliberately not attempted.
+- BBC captions (2026-10-12): BBC puts a screen-reader label in every figcaption (`<span class="visually-hidden">
+  Image caption, </span>`), so every BBC caption began "Image caption, ". One catalog rule drops it
+  (`figcaption .visually-hidden` in the bbc `junkSelectors`). BBC's credit ("Image source, Getty Images") sits
+  outside the figcaption and is not captured, before or after.
 - Publish dates (2026-10-12): an article's `publishedAt` is the feed item's original publish time; when
   the feed has none, the PAGE's own `datePublished` / `article:published_time` (never a "modified" time);
   only when neither exists the compile time, flagged `dateIsEstimated` and counted per source in the run
@@ -84,7 +123,8 @@ may change it unilaterally.
   of the SAME photograph the page publishes (`<img>`/`<picture>` srcsets and schema.org `ImageObject`
   entries): smallest one that reaches 1400 px, never a 3200+ px camera original, never a different
   crop (aspect must match), never a different photo (identity check on the asset id / `url=` source).
-  The feed's own copy of the lead leaves the body. A failed page fetch keeps the feed hero; the run
+  The feed's own copy of the lead stays in the body, marked `repeatsHero` (it used to be removed, which threw
+  its caption and credit away). A failed page fetch keeps the feed hero; the run
   report counts "heroes upgraded from the page". Every other source is untouched.
 - Articles: last 48h, all catalog sources, gate-passing only. Bundle stays under ~8MB gzipped
   (text only; images separate).
@@ -149,14 +189,17 @@ swift run -c release compile-edition \
 ## Tests
 
 ```sh
-cd aggregator && swift test   # 88 tests, no live network
+cd aggregator && swift test   # 113 tests, no live network
 ```
 
 Contract shape (golden round-trips, app-encoder-shape bodyBlocksJSON), vendored gate/language
 parity spot-checks, extractor runs against the app suite's own fixtures
 (`BroadsheetTests/Fixtures`), the logo-stamped hero fix (real Guardian fixtures through the
 vendored extractor and through the compiler: the stamped share card is never downloaded, the
-lead photo is; a clean og:image is untouched), end-to-end compiles against a fake HTTP client (steady-state
+lead photo is; a clean og:image is untouched), the BBC badge and hero-shown-once rules (real BBC, NPR, Vox and CBS
+captures through the vendored extractor and catalog: hero choice, which blocks are marked `repeatsHero`, the
+`repeatsHero` JSON key present only when true, and a compile that downloads the badge-free twin and never the
+badged share card), the BBC caption-label rule, end-to-end compiles against a fake HTTP client (steady-state
 304s, negative-cache skips, windowing, image-failure text-first tolerance), pruning, resize
 command builders (including the sips no-upscale guard), SHA-256 NIST vectors, drift
 detection, and the total-loss hardening (mid-run state checkpoints observed on disk, a

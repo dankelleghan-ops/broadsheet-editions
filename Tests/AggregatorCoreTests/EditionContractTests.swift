@@ -39,7 +39,37 @@ final class EditionContractTests: XCTestCase {
         XCTAssertFalse(editionString.contains("imageURLString"))
         XCTAssertFalse(editionString.contains("caption"))
         XCTAssertFalse(editionString.contains("credit"))
+        XCTAssertFalse(editionString.contains("repeatsHero"))
         XCTAssertTrue(editionString.contains("\"kind\":\"paragraph\""))
+    }
+
+    /// `repeatsHero` (2026-10-12, hero shown once) is an ADDITIVE optional key on an image block: absent when nil
+    /// (so every existing body encodes exactly as it always did), `true` on a block that shows the article's hero
+    /// photograph. Old app builds ignore it; new ones skip the block and show its caption under the hero.
+    func testRepeatsHeroIsOmittedWhenNilAndWrittenWhenTrue() throws {
+        let plain = BodyBlock(kind: .image, text: nil, imageURLString: "https://example.com/a.jpg", caption: "C", credit: nil)
+        XCTAssertFalse(try BodyBlockJSON.encode([plain]).contains("repeatsHero"))
+        // The exact JSON the old encoder wrote for these blocks, written out by hand (keys sorted): the new field
+        // leaves no trace when nil. (Comparing the encoder with itself, as this used to, proves nothing.)
+        let sampleLiteral = """
+        [{"kind":"paragraph","text":"First paragraph of prose."},\
+        {"caption":"A caption","credit":"A photographer","imageURLString":"https://example.com/photo.jpg","kind":"image"},\
+        {"kind":"heading","text":"A subhead"},\
+        {"kind":"paragraph","text":"Closing paragraph."}]
+        """
+        XCTAssertEqual(try CanonicalJSON.string(from: try BodyBlockJSON.encode(sampleBlocks())), sampleLiteral)
+        XCTAssertEqual(try CanonicalJSON.string(from: try BodyBlockJSON.encode([plain])),
+                       #"[{"caption":"C","imageURLString":"https://example.com/a.jpg","kind":"image"}]"#)
+
+        var marked = plain
+        marked.repeatsHero = true
+        let json = try BodyBlockJSON.encode([marked])
+        XCTAssertTrue(json.contains("\"repeatsHero\":true"), json)
+        XCTAssertEqual(try CanonicalJSON.string(from: json),
+                       #"[{"caption":"C","imageURLString":"https://example.com/a.jpg","kind":"image","repeatsHero":true}]"#)
+        XCTAssertEqual(try JSONDecoder().decode([BodyBlock].self, from: Data(json.utf8)), [marked])
+        // Decoding a body written before the key existed leaves it nil.
+        XCTAssertNil(try JSONDecoder().decode([BodyBlock].self, from: Data(try BodyBlockJSON.encode([plain]).utf8))[0].repeatsHero)
     }
 
     func testBodyBlocksJSONRoundTripsThroughAppDecoder() throws {
@@ -108,5 +138,15 @@ final class EditionContractTests: XCTestCase {
             "by Lisa Cuchara, Quinnipiac University — from The Conversation (CC BY-ND 4.0)"
         )
         XCTAssertNil(AttributionText.creditLine(author: nil, institution: nil))
+    }
+}
+
+/// Re-serializes a JSON string with its keys sorted and slashes unescaped, so it can be compared with a hand-written
+/// literal: `BodyBlockJSON.encode` uses a default `JSONEncoder`, whose key order is not guaranteed.
+enum CanonicalJSON {
+    static func string(from json: String) throws -> String {
+        let object = try JSONSerialization.jsonObject(with: Data(json.utf8))
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes])
+        return String(decoding: data, as: UTF8.self)
     }
 }

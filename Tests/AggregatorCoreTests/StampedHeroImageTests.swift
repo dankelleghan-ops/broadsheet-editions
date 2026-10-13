@@ -47,6 +47,8 @@ final class StampedHeroImageTests: XCTestCase {
         // Lead photo appears once: hero first, then the one inline photo.
         XCTAssertEqual(extracted.allImageURLs.count, 2)
         XCTAssertEqual(extracted.bodyBlocks.filter { $0.kind == .image }.count, 1)
+        // The one inline photo is a different photograph from the lead: no mark.
+        XCTAssertNil(extracted.bodyBlocks.first { $0.kind == .image }?.repeatsHero)
     }
 
     /// NEGATIVE CONTROL (vendored copy): a page whose og:image is clean keeps it, even though a
@@ -60,6 +62,59 @@ final class StampedHeroImageTests: XCTestCase {
                                                        item: item(Self.guardianURL), config: try guardianConfig())
         XCTAssertEqual(extracted.heroImageURL?.absoluteString,
                        "https://i.guim.co.uk/img/media/b731ec571946e4165d394b1c0795936a11412d78/671_195_4433_3548/master/4433.jpg?width=1200&quality=85&s=clean")
+    }
+
+    // MARK: - BBC badge (vendored extractor parity on the real captures)
+
+    private func bbcConfig() throws -> SourceConfig {
+        try XCTUnwrap(SourceCatalog.all.first { $0.id == "bbc" }, "bbc missing from vendored SourceCatalog")
+    }
+
+    private func extractBBC(_ fixtureName: String) throws -> ExtractedArticle {
+        let url = URL(string: "https://www.bbc.co.uk/news/articles/x")!
+        return try ContentExtractor().extract(fromPageHTML: try fixture(fixtureName), articleURL: url,
+                                              item: item(url.absoluteString), config: try bbcConfig())
+    }
+
+    /// The og:image of every BBC article is a `branded_news`/`branded_sport` share card with a badge burned in.
+    func testVendoredExtractorDropsTheBBCBadge_andMarksTheBodyCopyOfTheHeroPhoto() throws {
+        // No lead figure (the first figure is a video): the badge-free `standard/1200` twin of the og asset is the
+        // hero, and the body's HSI photo (same asset, standard/1680) is marked as its repeat, caption kept.
+        let omar = try extractBBC("page-bbc-lead-photo-after-paragraphs.html")
+        XCTAssertEqual(omar.heroImageURL?.absoluteString,
+                       "https://ichef.bbci.co.uk/ace/standard/1200/cpsprodpb/dc45/live/01c4d970-c64f-11f1-b47f-e3f9cf703bc3.png")
+        let omarMarked = omar.bodyBlocks.filter { $0.repeatsHero == true }
+        XCTAssertEqual(omarMarked.count, 1)
+        XCTAssertEqual(omarMarked.first?.caption, "HSI agents loading a box outside the residence")
+        XCTAssertEqual(omar.bodyBlocks.filter { $0.kind == .image && $0.repeatsHero != true }.count, 1, "the portrait")
+
+        // Video-led story whose og photo is not in the body: the twin, nothing marked, no mid-article image promoted.
+        let noLead = try extractBBC("page-bbc-no-lead-photo.html")
+        XCTAssertEqual(noLead.heroImageURL?.absoluteString,
+                       "https://ichef.bbci.co.uk/ace/standard/1200/cpsprodpb/2165/live/f588e620-c602-11f1-9a39-31b474234113.jpg")
+        XCTAssertTrue(noLead.bodyBlocks.allSatisfy { $0.repeatsHero == nil })
+
+        // BBC Sport (`branded_sport`): the lead figure's own rendition; the 3840 px copy is marked, never downloaded.
+        let sport = try extractBBC("page-bbc-sport-branded.html")
+        XCTAssertEqual(sport.heroImageURL?.absoluteString,
+                       "https://ichef.bbci.co.uk/ace/standard/1200/cpsprodpb/779a/live/b7058b10-c616-11f1-bc2e-018d645d8d21.jpg")
+        XCTAssertEqual(sport.bodyBlocks.filter { $0.repeatsHero == true }.count, 1)
+        XCTAssertEqual(sport.allImageURLs, [sport.heroImageURL!])
+    }
+
+    /// NEGATIVE CONTROL: a BBC rendition that is not a `branded_*` card is left exactly as it is (the hero stays the
+    /// og:image), and a non-BBC host with a `branded_news` path segment is nobody's stamp.
+    func testBBCRuleKeysOnTheBrandedSegmentAndTheBBCHostOnly() throws {
+        func stamped(_ s: String) -> Bool { ContentExtractor.isStampedSocialImage(URL(string: s)!) }
+        XCTAssertTrue(stamped("https://ichef.bbci.co.uk/ace/branded_news/1200/cpsprodpb/13bb/live/x.jpg"))
+        XCTAssertTrue(stamped("https://ichef.bbci.co.uk/ace/branded_sport/1200/cpsprodpb/779a/live/x.jpg"))
+        XCTAssertFalse(stamped("https://ichef.bbci.co.uk/ace/standard/1200/cpsprodpb/13bb/live/x.jpg"))
+        XCTAssertFalse(stamped("https://cdn.example.com/ace/branded_news/1200/cpsprodpb/13bb/live/x.jpg"))
+        XCTAssertEqual(ContentExtractor.unstampedTwin(of: URL(string: "https://ichef.bbci.co.uk/ace/branded_news/1200/cpsprodpb/13bb/live/x.jpg")!)?.absoluteString,
+                       "https://ichef.bbci.co.uk/ace/standard/1200/cpsprodpb/13bb/live/x.jpg", "width is kept, never changed")
+        XCTAssertNil(ContentExtractor.unstampedTwin(of: URL(string: "https://i.guim.co.uk/img/media/a/b/master/4433.jpg?width=1200&overlay-base64=AAAA&s=x")!),
+                     "Guardian's stamp is a signed query parameter: no twin can be derived")
+        XCTAssertNil(ContentExtractor.unstampedTwin(of: URL(string: "https://ichef.bbci.co.uk/ace/standard/1200/cpsprodpb/13bb/live/x.jpg")!))
     }
 
     // MARK: - end to end through the compiler
@@ -153,5 +208,53 @@ final class StampedHeroImageTests: XCTestCase {
         XCTAssertEqual(client.requestCount(of: Self.leadRendition), 0)
         XCTAssertEqual(edition.articles[0].topImageURL,
                        "https://pages.example/edition/images/\(expectedSHA16(forRaw: "CLEANOGBYTES")).jpg")
+    }
+
+    // MARK: - BBC end to end
+
+    /// A BBC-shaped source (the real catalog entry's selectors) pointing at stubbed hosts.
+    private func compileBBC(pageHTML: String, client: FakeHTTPClient) async throws -> Edition {
+        let feedURL = "https://news.example/feed"
+        let pageURL = "https://news.example/news/articles/cr93znyk44e1o"
+        client.stubs[feedURL] = .init(data: Data("""
+            <?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>News</title>
+            <item><title>Saudi capital airport hit</title><link>\(pageURL)</link><guid>bbc-1</guid>
+            <pubDate>\(rfc822(now.addingTimeInterval(-3600)))</pubDate></item></channel></rss>
+            """.utf8), etag: nil, lastModified: nil)
+        client.stubs[pageURL] = .init(data: Data(pageHTML.utf8), etag: nil, lastModified: nil)
+        let bbc = try bbcConfig()
+        let catalog = [SourceConfig(id: "bbc", name: "BBC News", feeds: [
+            FeedEndpoint(url: URL(string: feedURL)!, defaultCategory: .world)
+        ], strategy: .pageExtract, weight: 1.0, bodySelector: bbc.bodySelector, excludeURLPatterns: [],
+                                    maxPerDay: 40, junkSelectors: bbc.junkSelectors)]
+        let configuration = CompilerConfiguration(baseURL: "https://pages.example/edition", outDirectory: outDir,
+                                                  stateFileURL: stateURL, now: { self.now })
+        _ = try await EditionCompiler(catalog: catalog, client: client, resizer: FakeResizer(),
+                                      configuration: configuration).run()
+        let result = try ProcessRunner.run(["gunzip", "-c", outDir.appendingPathComponent("edition.json.gz").path])
+        XCTAssertEqual(result.status, 0, result.stderrText)
+        return try JSONDecoder().decode(Edition.self, from: result.stdout)
+    }
+
+    func testCompilerDownloadsTheBadgeFreeTwinNotTheBBCNewsShareCard() async throws {
+        let branded = "https://ichef.bbci.co.uk/ace/branded_news/1200/cpsprodpb/dc45/live/01c4d970-c64f-11f1-b47f-e3f9cf703bc3.png"
+        let twin = "https://ichef.bbci.co.uk/ace/standard/1200/cpsprodpb/dc45/live/01c4d970-c64f-11f1-b47f-e3f9cf703bc3.png"
+        let client = FakeHTTPClient()
+        client.stubs[branded] = .init(data: Data("BADGEDCARD".utf8), etag: nil, lastModified: nil)
+        client.stubs[twin] = .init(data: Data("TWINPHOTO".utf8), etag: nil, lastModified: nil)
+
+        let edition = try await compileBBC(pageHTML: try fixture("page-bbc-lead-photo-after-paragraphs.html"), client: client)
+
+        XCTAssertEqual(edition.articles.count, 1)
+        XCTAssertEqual(client.requestCount(of: branded), 0, "the badged share card must never be downloaded")
+        XCTAssertEqual(client.requestCount(of: twin), 1)
+        XCTAssertEqual(edition.articles[0].topImageURL,
+                       "https://pages.example/edition/images/\(expectedSHA16(forRaw: "TWINPHOTO")).jpg")
+        // The published body carries the mark on the one block that shows the hero photo, with its caption.
+        let blocks = try JSONDecoder().decode([BodyBlock].self, from: Data(edition.articles[0].bodyBlocksJSON.utf8))
+        let marked = blocks.filter { $0.repeatsHero == true }
+        XCTAssertEqual(marked.count, 1)
+        XCTAssertEqual(marked.first?.caption, "HSI agents loading a box outside the residence")
+        XCTAssertTrue(edition.articles[0].bodyBlocksJSON.contains("\"repeatsHero\":true"))
     }
 }

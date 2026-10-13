@@ -159,6 +159,14 @@ struct BodyBlock: Codable, Equatable, Sendable {
     var imageURLString: String?
     var caption: String?
     var credit: String?
+    /// True on an image block that shows the SAME photograph as the article's hero image (set by
+    /// `ContentExtractor`; see "Hero shown once" there). The reader draws that photo once, as the
+    /// hero, with this block's caption and credit under it, and does not draw the block itself --
+    /// unless the article ended up with no stored hero, when the block is drawn as usual. The block
+    /// stays in the body rather than being removed because it is the only place the lead photo's
+    /// caption and credit live. nil everywhere else, and then absent from the JSON, so bodies
+    /// without a repeat encode exactly as they always did.
+    var repeatsHero: Bool? = nil
 
     /// Combines a caption + credit into a single `" — "`-joined display string, treating each
     /// as absent when nil or empty. Cheap minor #7 (review fix round): shared by every
