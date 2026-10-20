@@ -9,13 +9,55 @@ enum SourceCatalog {
     private static let standardDecayHours = 12.0
     private static let slowDecayHours = 24.0
 
+    // Sections (topic feeds, approved by Daniel 2026-10-15). A TOPIC FEED is a feed that carries one topic from an outlet
+    // that already is (or newly joins) the catalog: the Guardian's business feed, NPR's tech feed, the Sun-Times' Bears feed.
+    // Every story it brings in is filed under that topic (`FeedEndpoint.topicHint`) and has its own daily allowance
+    // (a quarter of the reader's "stories per source per day", `ArticleStore.topicAllowance`) so it never eats into the outlet's
+    // main-news budget. Topic feeds are listed AFTER the outlet's
+    // main feeds: a story that appears in both is taken through the main feed (the first feed to see a guid wins, as ever),
+    // and the edition path's stand-in endpoint for a story (`ArticleStore.insertEditionRow`) stays the first main feed.
+    //
+    // The hints are `Topic` raw values. This file is vendored into the edition builder, which has no `Topic` type, so they are
+    // plain strings here; SourceCatalogTests pins every hint in the catalog to a real `Topic`.
+    private enum Hint {
+        static let business = "business", sports = "sports", tech = "tech", scienceHealth = "scienceHealth"
+        static let climate = "climate", arts = "arts", books = "books", food = "food", travel = "travel"
+        static let style = "style", realEstate = "realEstate", obituaries = "obituaries"
+    }
+
+    /// One topic feed: the feed's URL, the place its stories default to (the same `defaultCategory` a main feed has), and the topic
+    /// every story belongs to. It declares NO `maxPerDay` of its own: the edition builder takes the default 10 new stories per run
+    /// from it (`FeedEndpoint.topicMaxPerDay`), and the app's daily allowance follows the reader's "stories per source per day"
+    /// setting (a quarter of it, never below 2; see `ArticleStore.topicAllowance`). A `maxPerDay` on a topic feed would be a
+    /// CEILING on both, so a feed that needs a tighter limit than the setting gives declares one.
+    private static func topicFeed(_ urlString: String, _ place: ArticleCategory, _ topic: String) -> FeedEndpoint {
+        FeedEndpoint(url: URL(string: urlString)!, defaultCategory: place, topicHint: topic)
+    }
+
     static let all: [SourceConfig] = [
         SourceConfig(
             id: "guardian",
             name: "The Guardian",
             feeds: [
                 FeedEndpoint(url: URL(string: "https://theguardian.com/world/rss")!, defaultCategory: .world),
-                FeedEndpoint(url: URL(string: "https://theguardian.com/us-news/rss")!, defaultCategory: .us)
+                FeedEndpoint(url: URL(string: "https://theguardian.com/us-news/rss")!, defaultCategory: .us),
+                // Sections: the Guardian's own section feeds (live-verified 2026-10-15/18; the Guardian's `us/` editions where the
+                // U.S. edition exists, the global feed where it does not). Items carry /gallery/, /live/, /video/, /audio/ and
+                // /thefilter/ pages: `ArticleGate.addressRejectionReason` drops those, and its 7-day age rule drops the travel
+                // feed's 2023-24 guides.
+                topicFeed("https://www.theguardian.com/us/business/rss", .us, Hint.business),
+                topicFeed("https://www.theguardian.com/us/sport/rss", .us, Hint.sports),
+                topicFeed("https://www.theguardian.com/us/technology/rss", .us, Hint.tech),
+                topicFeed("https://www.theguardian.com/science/rss", .world, Hint.scienceHealth),
+                topicFeed("https://www.theguardian.com/environment/climate-crisis/rss", .world, Hint.climate),
+                topicFeed("https://www.theguardian.com/us/culture/rss", .us, Hint.arts),
+                topicFeed("https://www.theguardian.com/us/film/rss", .world, Hint.arts),
+                topicFeed("https://www.theguardian.com/music/rss", .world, Hint.arts),
+                topicFeed("https://www.theguardian.com/books/rss", .world, Hint.books),
+                topicFeed("https://www.theguardian.com/food/rss", .world, Hint.food),
+                topicFeed("https://www.theguardian.com/us/travel/rss", .world, Hint.travel),
+                topicFeed("https://www.theguardian.com/fashion/rss", .world, Hint.style),
+                topicFeed("https://www.theguardian.com/tone/obituaries/rss", .world, Hint.obituaries)
             ],
             strategy: .pageExtract,
             weight: 1.0,
@@ -55,7 +97,18 @@ enum SourceCatalog {
                 // rather than a bare "opinion" path segment (see SubtopicClassifier's
                 // genericOpinionMatch doc comment). Extracts fine via the existing #storytext
                 // selector below -- same template as NPR's other sections.
-                FeedEndpoint(url: URL(string: "https://feeds.npr.org/1057/rss.xml")!, defaultCategory: .us)
+                FeedEndpoint(url: URL(string: "https://feeds.npr.org/1057/rss.xml")!, defaultCategory: .us),
+                // Sections: NPR's topic feeds (1006 Business, 1019 Technology, 1128 Health, 1007 Science, 1167 Climate,
+                // 1008 Arts & Life, 1032 Books, 1062 Obituaries). They carry audio-only blurbs next to real stories, so
+                // `ArticleGate.topicFeedMinimumWords` requires 150 words of body from NPR's topic feeds.
+                topicFeed("https://feeds.npr.org/1006/rss.xml", .us, Hint.business),
+                topicFeed("https://feeds.npr.org/1019/rss.xml", .us, Hint.tech),
+                topicFeed("https://feeds.npr.org/1128/rss.xml", .us, Hint.scienceHealth),
+                topicFeed("https://feeds.npr.org/1007/rss.xml", .us, Hint.scienceHealth),
+                topicFeed("https://feeds.npr.org/1167/rss.xml", .us, Hint.climate),
+                topicFeed("https://feeds.npr.org/1008/rss.xml", .us, Hint.arts),
+                topicFeed("https://feeds.npr.org/1032/rss.xml", .us, Hint.books),
+                topicFeed("https://feeds.npr.org/1062/rss.xml", .us, Hint.obituaries)
             ],
             strategy: .pageExtract,
             weight: 1.0,
@@ -74,7 +127,16 @@ enum SourceCatalog {
             id: "bbc",
             name: "BBC News",
             feeds: [
-                FeedEndpoint(url: URL(string: "https://feeds.bbci.co.uk/news/world/rss.xml")!, defaultCategory: .world)
+                FeedEndpoint(url: URL(string: "https://feeds.bbci.co.uk/news/world/rss.xml")!, defaultCategory: .world),
+                // Sections: BBC News' business, technology, health, science & environment and entertainment & arts feeds, plus
+                // bbc.com's Culture and Travel feeds.
+                topicFeed("https://feeds.bbci.co.uk/news/business/rss.xml", .world, Hint.business),
+                topicFeed("https://feeds.bbci.co.uk/news/technology/rss.xml", .world, Hint.tech),
+                topicFeed("https://feeds.bbci.co.uk/news/health/rss.xml", .world, Hint.scienceHealth),
+                topicFeed("https://feeds.bbci.co.uk/news/science_and_environment/rss.xml", .world, Hint.scienceHealth),
+                topicFeed("https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml", .world, Hint.arts),
+                topicFeed("https://www.bbc.com/culture/feed.rss", .world, Hint.arts),
+                topicFeed("https://www.bbc.com/travel/feed.rss", .world, Hint.travel)
             ],
             strategy: .pageExtract,
             weight: 1.0,
@@ -102,7 +164,11 @@ enum SourceCatalog {
             id: "pbs",
             name: "PBS NewsHour",
             feeds: [
-                FeedEndpoint(url: URL(string: "https://pbs.org/newshour/feeds/rss/headlines")!, defaultCategory: .us)
+                FeedEndpoint(url: URL(string: "https://pbs.org/newshour/feeds/rss/headlines")!, defaultCategory: .us),
+                // Sections: PBS NewsHour's economy, health and science feeds.
+                topicFeed("https://www.pbs.org/newshour/feeds/rss/economy", .us, Hint.business),
+                topicFeed("https://www.pbs.org/newshour/feeds/rss/health", .us, Hint.scienceHealth),
+                topicFeed("https://www.pbs.org/newshour/feeds/rss/science", .us, Hint.scienceHealth)
             ],
             strategy: .pageExtract,
             weight: 1.0,
@@ -146,7 +212,10 @@ enum SourceCatalog {
             id: "fox",
             name: "Fox News",
             feeds: [
-                FeedEndpoint(url: URL(string: "https://moxie.foxnews.com/google-publisher/latest.xml")!, defaultCategory: .us)
+                FeedEndpoint(url: URL(string: "https://moxie.foxnews.com/google-publisher/latest.xml")!, defaultCategory: .us),
+                // Sections: Fox News Sports and Fox Business. (Fox travel was considered and left out on 2026-10-18.)
+                topicFeed("https://moxie.foxnews.com/google-publisher/sports.xml", .us, Hint.sports),
+                topicFeed("https://moxie.foxbusiness.com/google-publisher/latest.xml", .us, Hint.business)
             ],
             strategy: .feedFullText,
             weight: 0.75,
@@ -159,7 +228,13 @@ enum SourceCatalog {
             id: "nypost",
             name: "NY Post",
             feeds: [
-                FeedEndpoint(url: URL(string: "https://nypost.com/feed/")!, defaultCategory: .us)
+                FeedEndpoint(url: URL(string: "https://nypost.com/feed/")!, defaultCategory: .us),
+                // Sections: NY Post's business, sports, travel, real-estate and fashion-and-beauty feeds.
+                topicFeed("https://nypost.com/business/feed/", .us, Hint.business),
+                topicFeed("https://nypost.com/sports/feed/", .us, Hint.sports),
+                topicFeed("https://nypost.com/travel/feed/", .us, Hint.travel),
+                topicFeed("https://nypost.com/real-estate/feed/", .us, Hint.realEstate),
+                topicFeed("https://nypost.com/fashion-and-beauty/feed/", .us, Hint.style)
             ],
             strategy: .pageExtract,
             weight: 0.75,
@@ -224,7 +299,9 @@ enum SourceCatalog {
             id: "blockclub",
             name: "Block Club Chicago",
             feeds: [
-                FeedEndpoint(url: URL(string: "https://blockclubchicago.org/feed/")!, defaultCategory: .chicago)
+                FeedEndpoint(url: URL(string: "https://blockclubchicago.org/feed/")!, defaultCategory: .chicago),
+                // Sections: Block Club's restaurants-and-bars category.
+                topicFeed("https://blockclubchicago.org/category/restaurants-bars/feed/", .chicago, Hint.food)
             ],
             strategy: .feedFullText,
             weight: 1.0,
@@ -237,7 +314,20 @@ enum SourceCatalog {
             id: "suntimes",
             name: "Chicago Sun-Times",
             feeds: [
-                FeedEndpoint(url: URL(string: "https://chicago.suntimes.com/rss/index.xml")!, defaultCategory: .chicago)
+                FeedEndpoint(url: URL(string: "https://chicago.suntimes.com/rss/index.xml")!, defaultCategory: .chicago),
+                // Sections: the Sun-Times' sports feed and its four team feeds (Bears, White Sox, Bulls, Blackhawks; the team
+                // feeds repeat much of the sports feed, and a guid already taken is skipped), then arts-and-culture, food-drink,
+                // real-estate and obituaries. All live-verified 2026-10-18. The five sports feeds share ONE sports allowance
+                // per day (stories are counted per outlet and topic, see `ArticleStore.topicAllowance`).
+                topicFeed("https://chicago.suntimes.com/rss/sports/index.xml", .chicago, Hint.sports),
+                topicFeed("https://chicago.suntimes.com/rss/bears/index.xml", .chicago, Hint.sports),
+                topicFeed("https://chicago.suntimes.com/rss/white-sox/index.xml", .chicago, Hint.sports),
+                topicFeed("https://chicago.suntimes.com/rss/bulls/index.xml", .chicago, Hint.sports),
+                topicFeed("https://chicago.suntimes.com/rss/blackhawks/index.xml", .chicago, Hint.sports),
+                topicFeed("https://chicago.suntimes.com/rss/arts-and-culture/index.xml", .chicago, Hint.arts),
+                topicFeed("https://chicago.suntimes.com/rss/food-drink/index.xml", .chicago, Hint.food),
+                topicFeed("https://chicago.suntimes.com/rss/real-estate/index.xml", .chicago, Hint.realEstate),
+                topicFeed("https://chicago.suntimes.com/rss/obituaries/index.xml", .chicago, Hint.obituaries)
             ],
             strategy: .feedFullText,
             weight: 1.0,
@@ -271,7 +361,11 @@ enum SourceCatalog {
             id: "reader",
             name: "Chicago Reader",
             feeds: [
-                FeedEndpoint(url: URL(string: "https://chicagoreader.com/feed/")!, defaultCategory: .chicago)
+                FeedEndpoint(url: URL(string: "https://chicagoreader.com/feed/")!, defaultCategory: .chicago),
+                // Sections: the Reader's music, film-and-TV and food categories.
+                topicFeed("https://chicagoreader.com/category/music/feed/", .chicago, Hint.arts),
+                topicFeed("https://chicagoreader.com/category/film-tv/feed/", .chicago, Hint.arts),
+                topicFeed("https://chicagoreader.com/category/food/feed/", .chicago, Hint.food)
             ],
             strategy: .pageExtract,
             weight: 1.0,
@@ -356,7 +450,9 @@ enum SourceCatalog {
             id: "cbs",
             name: "CBS News",
             feeds: [
-                FeedEndpoint(url: URL(string: "https://www.cbsnews.com/latest/rss/main")!, defaultCategory: .us)
+                FeedEndpoint(url: URL(string: "https://www.cbsnews.com/latest/rss/main")!, defaultCategory: .us),
+                // Sections: CBS MoneyWatch.
+                topicFeed("https://www.cbsnews.com/latest/rss/moneywatch", .us, Hint.business)
             ],
             strategy: .pageExtract,
             weight: 0.85,
@@ -581,6 +677,202 @@ enum SourceCatalog {
             excludeURLPatterns: [],
             maxPerDay: 40,
             decayHalfLifeHours: standardDecayHours
+        ),
+
+        // Sections: 13 new outlets, approved by Daniel 2026-10-15 and live-verified 2026-10-18 (free, full text reachable, no bot
+        // wall; CNBC and Redfin turned a curl user agent away on 2026-10-15 but serve the compiler's own honest user agent).
+        // A 14th, Science News, was approved and then LEFT OUT on 2026-10-18: its article pages are metered (Zephr). Fetched one at a
+        // time with no cookies every page is whole, but a session that has read two articles gets the third cut to a few
+        // paragraphs behind a sign-in form (measured: 8 of 10 articles in one compile run). Fetching without the session cookie to
+        // dodge the meter would be bypassing a paywall, so the outlet is not in the catalog (SourceCatalogTests pins that).
+        // Each one carries TOPIC feeds only (one `FeedEndpoint.topicHint` per feed), so none of them spends a source's main daily
+        // cap; they have their own daily allowance per feed topic (a quarter of the reader's per-source setting). KFF Health News, Grist, Lit Hub, Chicago Review of Books,
+        // Eater and Redfin put the full article in the feed (feedFullText, no page fetch); the rest are page-extract with a
+        // body selector read off real article pages (CNBC, ESPN, TechCrunch, Ars Technica, Afar, Chicago YIMBY and Urbanize:
+        // Urbanize's feed carries the article only in <description>, which the feed parser does not treat as full text).
+        SourceConfig(
+            id: "cnbc",
+            name: "CNBC",
+            feeds: [
+                topicFeed("https://www.cnbc.com/id/10001147/device/rss/rss.html", .us, Hint.business),
+                topicFeed("https://www.cnbc.com/id/10000664/device/rss/rss.html", .us, Hint.business)
+            ],
+            strategy: .pageExtract,
+            weight: 0.85,
+            bodySelector: ".ArticleBody-articleBody",
+            excludeURLPatterns: [],
+            maxPerDay: 40,
+            decayHalfLifeHours: standardDecayHours,
+            // Live 2026-10-18: every CNBC body opened with a lone "In this article" paragraph, the label of the stock-quote
+            // box (`.RelatedQuotes-relatedQuotes`) that sits inside the article body.
+            junkSelectors: [".RelatedQuotes-relatedQuotes"]
+        ),
+        SourceConfig(
+            id: "espn",
+            name: "ESPN",
+            feeds: [
+                topicFeed("https://www.espn.com/espn/rss/news", .us, Hint.sports)
+            ],
+            strategy: .pageExtract,
+            weight: 0.85,
+            bodySelector: ".article-body",
+            excludeURLPatterns: [],
+            maxPerDay: 40,
+            decayHalfLifeHours: fastDecayHours,
+            // Live 2026-10-18: `.article-body` opens with the byline block (`.article-meta`: the author's 40-pixel headshot)
+            // and carries the "content reactions" widget (a check-mark icon image); both came out as stray image blocks.
+            junkSelectors: [".article-meta", ".content-reactions"]
+        ),
+        SourceConfig(
+            id: "techcrunch",
+            name: "TechCrunch",
+            feeds: [
+                topicFeed("https://techcrunch.com/feed/", .us, Hint.tech)
+            ],
+            strategy: .pageExtract,
+            weight: 0.85,
+            bodySelector: ".wp-block-post-content",
+            excludeURLPatterns: [],
+            maxPerDay: 40,
+            decayHalfLifeHours: standardDecayHours
+        ),
+        SourceConfig(
+            id: "arstechnica",
+            name: "Ars Technica",
+            feeds: [
+                topicFeed("https://feeds.arstechnica.com/arstechnica/index", .us, Hint.tech)
+            ],
+            strategy: .pageExtract,
+            weight: 1.0,
+            bodySelector: ".article-content",
+            excludeURLPatterns: [],
+            maxPerDay: 40,
+            decayHalfLifeHours: standardDecayHours
+        ),
+        SourceConfig(
+            id: "kffhealthnews",
+            name: "KFF Health News",
+            feeds: [
+                topicFeed("https://kffhealthnews.org/feed/", .us, Hint.scienceHealth)
+            ],
+            strategy: .feedFullText,
+            weight: 1.0,
+            bodySelector: nil,
+            excludeURLPatterns: [],
+            maxPerDay: 40,
+            decayHalfLifeHours: slowDecayHours
+        ),
+        SourceConfig(
+            id: "grist",
+            name: "Grist",
+            feeds: [
+                topicFeed("https://grist.org/feed/", .us, Hint.climate)
+            ],
+            strategy: .feedFullText,
+            weight: 0.85,
+            bodySelector: nil,
+            excludeURLPatterns: [],
+            maxPerDay: 40,
+            decayHalfLifeHours: slowDecayHours
+        ),
+        SourceConfig(
+            id: "lithub",
+            name: "Lit Hub",
+            feeds: [
+                topicFeed("https://lithub.com/feed/", .us, Hint.books)
+            ],
+            strategy: .feedFullText,
+            weight: 0.85,
+            bodySelector: nil,
+            excludeURLPatterns: [],
+            maxPerDay: 40,
+            decayHalfLifeHours: slowDecayHours
+        ),
+        SourceConfig(
+            id: "chireviewofbooks",
+            name: "Chicago Review of Books",
+            feeds: [
+                // Most of its reviews are of national books and authors, so its stories default to U.S., not Chicago.
+                topicFeed("https://chireviewofbooks.com/feed/", .us, Hint.books)
+            ],
+            strategy: .feedFullText,
+            weight: 0.85,
+            bodySelector: nil,
+            excludeURLPatterns: [],
+            maxPerDay: 40,
+            decayHalfLifeHours: slowDecayHours
+        ),
+        SourceConfig(
+            id: "eater",
+            name: "Eater",
+            feeds: [
+                topicFeed("https://www.eater.com/rss/index.xml", .us, Hint.food),
+                topicFeed("https://chicago.eater.com/rss/index.xml", .chicago, Hint.food)
+            ],
+            strategy: .feedFullText,
+            weight: 0.85,
+            bodySelector: nil,
+            // Eater's feed carries affiliate "add-to-cart" shopping posts (live 2026-10-18: "The Best Gifts for Martini Lovers");
+            // `ArticleGate.addressRejectionReason` drops them (/add-to-cart/), for every outlet.
+            excludeURLPatterns: [],
+            maxPerDay: 40,
+            decayHalfLifeHours: standardDecayHours
+        ),
+        SourceConfig(
+            id: "afar",
+            name: "Afar",
+            feeds: [
+                topicFeed("https://www.afar.com/index.rss", .us, Hint.travel)
+            ],
+            strategy: .pageExtract,
+            weight: 0.85,
+            bodySelector: ".article-body",
+            excludeURLPatterns: [],
+            maxPerDay: 40,
+            decayHalfLifeHours: slowDecayHours
+        ),
+        SourceConfig(
+            id: "chicagoyimby",
+            name: "Chicago YIMBY",
+            feeds: [
+                topicFeed("https://chicagoyimby.com/feed", .chicago, Hint.realEstate)
+            ],
+            strategy: .pageExtract,
+            weight: 0.85,
+            bodySelector: ".entry-content",
+            excludeURLPatterns: [],
+            maxPerDay: 40,
+            decayHalfLifeHours: standardDecayHours,
+            // Live 2026-10-18: every YIMBY article ends with a paragraph of newsletter / social links ("Subscribe to YIMBY's
+            // daily e-mail ... Follow YIMBYgram ...") plus a "Make YIMBY preferred on Google" badge image. The newsletter link
+            // (eepurl.com) identifies the paragraph.
+            junkSelectors: ["p:has(a[href*=eepurl.com])"]
+        ),
+        SourceConfig(
+            id: "urbanize",
+            name: "Urbanize Chicago",
+            feeds: [
+                topicFeed("https://chicago.urbanize.city/rss.xml", .chicago, Hint.realEstate)
+            ],
+            strategy: .pageExtract,
+            weight: 0.85,
+            bodySelector: ".article-body",
+            excludeURLPatterns: [],
+            maxPerDay: 40,
+            decayHalfLifeHours: standardDecayHours
+        ),
+        SourceConfig(
+            id: "redfin",
+            name: "Redfin News",
+            feeds: [
+                topicFeed("https://www.redfin.com/news/feed/", .us, Hint.realEstate)
+            ],
+            strategy: .feedFullText,
+            weight: 0.75,
+            bodySelector: nil,
+            excludeURLPatterns: [],
+            maxPerDay: 40,
+            decayHalfLifeHours: slowDecayHours
         )
     ]
 
@@ -596,7 +888,16 @@ enum SourceCatalog {
     /// (which would needlessly lengthen kickers like `guardian` -> "THE GUARDIAN").
     private static let kickerDisplayNameOverrides: [String: String] = [
         "suntimes": "Sun-Times",
-        "blockclub": "Block Club"
+        "blockclub": "Block Club",
+        // Sections: the new outlets whose raw id runs words together ("ARSTECHNICA", "KFFHEALTHNEWS"). Kept to 12 characters or
+        // fewer, the length of "CONVERSATION", the longest kicker label in the catalog: a longer label clips in a brief row at the
+        // biggest text sizes (v1.9.1; BriefRowSourceClippingTests measures the longest). So "KFF HEALTH", "CHI. REVIEW" (Chicago
+        // Review of Books) and "YIMBY" (Chicago YIMBY) are short forms.
+        "arstechnica": "Ars Technica",
+        "kffhealthnews": "KFF Health",
+        "lithub": "Lit Hub",
+        "chireviewofbooks": "Chi. Review",
+        "chicagoyimby": "YIMBY"
     ]
 
     static func kickerDisplayName(for sourceID: String) -> String {

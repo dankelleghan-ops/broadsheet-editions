@@ -42,6 +42,13 @@ struct EditionArticle: Codable, Equatable {
     /// first-seen time. Omitted otherwise, so the bundle stays the same size and builds that predate
     /// the field never see it. Contract v1 is otherwise unchanged.
     var dateIsEstimated: Bool? = nil
+    /// ADDITIVE optional field (sections, 2026-10-18): the `Topic` raw value ("business", "sports", "tech", "scienceHealth",
+    /// "climate", "arts", "books", "food", "travel", "style", "realEstate", "obituaries") of the TOPIC FEED the compiler fetched
+    /// this article through (`FeedEndpoint.topicHint` in the vendored catalog). Omitted for an article that came through a
+    /// main-news feed, so a bundle with no topic feeds is byte-for-byte what it always was, and builds that predate the field
+    /// never see it. The app files the article under that topic and counts it against its own daily allowance, not the source's
+    /// main cap. Contract v1 is otherwise unchanged.
+    var topicHint: String? = nil
 }
 
 /// The one true bodyBlocks encoder: the exact call `ArticleStore.downloadItems` makes

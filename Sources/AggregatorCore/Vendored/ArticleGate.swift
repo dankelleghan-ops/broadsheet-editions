@@ -34,10 +34,33 @@ enum ArticleGate {
     /// release and must not be touched -- see `.superpowers/sdd/v1.12-language-report.md`).
     /// Turning the toggle off means this parameter evaluates to `false` and `LanguageFilter` is
     /// never even invoked -- zero detection cost, per spec.
+    ///
+    /// Sections (topic feeds) added four optional inputs, all defaulting to "not supplied" so every existing call site keeps its
+    /// exact prior behavior:
+    ///   - `sourceID` and `topicHint`: the outlet and the topic of the feed the article came through (nil for a main-news feed).
+    ///     They switch on the sports-feed title rule (`topicHint == "sports"`) and the per-outlet topic-feed length floor
+    ///     (`topicFeedMinimumWords`: NPR's topic feeds carry short audio-only blurbs).
+    ///   - `publishedAt` and `now`: when a caller supplies the item's publish time, an item older than `maximumItemAge` (7 days)
+    ///     is rejected (the Guardian's travel feed still carries 2023-24 guides). nil = no age check.
+    /// The web-address rule (`addressRejectionReason`) needs no input beyond the article's own `url`, so it applies to every
+    /// call that has one: the phone's feed path, the phone's bundle re-check and the edition builder all reject the same pages.
     static func evaluate(_ article: ExtractedArticle, requiresAttribution: Bool = false,
-                          englishOnly: Bool = Prefs.shared.englishOnlyArticles) -> GateResult {
+                          englishOnly: Bool = Prefs.shared.englishOnlyArticles,
+                          sourceID: String? = nil, topicHint: String? = nil,
+                          publishedAt: Date? = nil, now: Date = Date()) -> GateResult {
         if requiresAttribution, article.author == nil, article.authorInstitution == nil {
             return .fail(reason: "requires attribution but no author or institution could be extracted")
+        }
+
+        // Sections: cheap rules about WHAT the page is, before any body work.
+        if let url = article.url, let reason = addressRejectionReason(url) {
+            return .fail(reason: reason)
+        }
+        if topicHint == Self.sportsTopicHint, let reason = sportsFeedTitleRejectionReason(article.title) {
+            return .fail(reason: reason)
+        }
+        if isTooOld(publishedAt: publishedAt, now: now) {
+            return .fail(reason: "older than \(Int(maximumItemAge / 86_400)) days")
         }
 
         let paragraphs = article.bodyBlocks.filter { $0.kind == .paragraph }
@@ -49,6 +72,16 @@ enum ArticleGate {
         let combinedText = paragraphs.compactMap { $0.text }.joined(separator: " ")
         guard combinedText.count >= 600 else {
             return .fail(reason: "only \(combinedText.count) paragraph chars, need >= 600")
+        }
+
+        // Sections: an outlet's topic feeds can carry short blurbs next to real stories (NPR's carry audio-only items of two
+        // or three sentences). The floor above is the same for every feed; this stricter, word-based one applies only to the
+        // topic feeds of the outlets named in `topicFeedMinimumWords`, never to their main-news feeds.
+        if topicHint != nil, let sourceID, let minimumWords = topicFeedMinimumWords[sourceID] {
+            let wordCount = combinedText.split(whereSeparator: { $0.isWhitespace }).count
+            guard wordCount >= minimumWords else {
+                return .fail(reason: "only \(wordCount) words, need >= \(minimumWords) for \(sourceID) topic feeds")
+            }
         }
 
         // v1.3.3 fix D (reader-extraction-investigation.md §2c/§6c): the floors above already
@@ -122,6 +155,73 @@ enum ArticleGate {
         }
 
         return .pass
+    }
+
+    // MARK: - Sections: topic-feed quality rules
+
+    /// The `Topic` raw value the sports-feed title rule keys on (a String: this file is vendored into the edition builder, which has
+    /// no `Topic` type; a test pins it to `Topic.sports.rawValue`).
+    static let sportsTopicHint = "sports"
+
+    /// Page kinds that are never a readable story, matched as a whole path segment ANYWHERE in the web address: photo galleries,
+    /// live blogs, video and audio pages, podcast pages (audio with little text), the Guardian's shopping-recommendation sections
+    /// ("The Filter") and wordless cartoon pages (`/picture/`), and Eater's affiliate shopping posts (`/add-to-cart/`).
+    static let rejectedAddressSegments = ["gallery", "live", "video", "videos", "audio", "podcast", "podcasts",
+                                          "thefilter", "thefilter-us", "picture", "add-to-cart"]
+
+    /// Segments rejected on one outlet's domain only: CNBC's paid Investing Club and Pro sections.
+    static let rejectedAddressSegmentsByDomain: [String: [String]] = ["cnbc.com": ["investingclub", "pro"]]
+
+    /// Why this web address is not a story we ingest, or nil when it is fine. Whole segments only ("/live/" does not match
+    /// "/liverpool-news/"), case-insensitive, subdomains of a listed domain count ("www.cnbc.com").
+    static func addressRejectionReason(_ url: URL) -> String? {
+        let segments = url.path.lowercased().split(separator: "/").map(String.init)
+        guard !segments.isEmpty else { return nil }
+        for segment in rejectedAddressSegments where segments.contains(segment) {
+            return "web address has a /\(segment)/ section"
+        }
+        if let host = url.host?.lowercased() {
+            for (domain, extra) in rejectedAddressSegmentsByDomain where host == domain || host.hasSuffix("." + domain) {
+                for segment in extra where segments.contains(segment) {
+                    return "web address has a /\(segment)/ section on \(domain)"
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Whole words that mark a betting or fantasy piece in a SPORTS feed's headline.
+    private static let sportsFeedBannedWords: Set<String> = ["odds", "betting", "sportsbook", "parlay", "props", "fantasy"]
+    /// Two-word markers (adjacent whole words).
+    private static let sportsFeedBannedPhrases: [[String]] = [["best", "bets"], ["expert", "picks"], ["picks", "and", "predictions"], ["best", "picks"], ["promo", "code"]]
+
+    /// Why this headline, from a sports feed, is a betting or fantasy piece, or nil. Whole words, case-insensitive:
+    /// "Props" matches, "Pickett" and "Propane" inside another word do not.
+    static func sportsFeedTitleRejectionReason(_ title: String) -> String? {
+        let words = title.lowercased()
+            .split(whereSeparator: { !($0.isLetter || $0.isNumber) })
+            .map(String.init)
+        for word in words where sportsFeedBannedWords.contains(word) {
+            return "sports feed betting/fantasy headline (\"\(word)\")"
+        }
+        for phrase in sportsFeedBannedPhrases where words.count >= phrase.count {
+            for start in 0...(words.count - phrase.count) where Array(words[start..<(start + phrase.count)]) == phrase {
+                return "sports feed betting/fantasy headline (\"\(phrase.joined(separator: " "))\")"
+            }
+        }
+        return nil
+    }
+
+    /// Outlets whose TOPIC feeds must carry at least this many words of body (see the floor in `evaluate`).
+    static let topicFeedMinimumWords: [String: Int] = ["npr": 150]
+
+    /// How old an item may be (by its publish time) and still be ingested: the app's 7-day retention window.
+    static let maximumItemAge: TimeInterval = 7 * 24 * 3600
+
+    /// True when `publishedAt` is known and older than `maximumItemAge` before `now`. An undated item is never "too old".
+    static func isTooOld(publishedAt: Date?, now: Date) -> Bool {
+        guard let publishedAt else { return false }
+        return now.timeIntervalSince(publishedAt) > maximumItemAge
     }
 
     /// True if `blocks` contains at least one run of `minimumRunLength`-or-more `.paragraph`

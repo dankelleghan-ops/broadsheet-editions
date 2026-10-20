@@ -91,4 +91,7 @@ struct CompiledArticle: Codable, Equatable {
     /// The original remote hero URL, kept so a run that lost the output-dir cache can
     /// re-download and re-resize the image for a retained article.
     var imageSourceURL: String?
+    /// The topic of the topic feed this article was fetched through (`FeedEndpoint.topicHint`), or nil for a main-news feed.
+    /// Optional with a nil default, so every state file written before sections still decodes.
+    var topicHint: String? = nil
 }

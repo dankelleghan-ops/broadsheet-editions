@@ -13,6 +13,36 @@ struct FeedEndpoint: Sendable {
     /// timestamp is only ever parsed when the feed declares its zone here -- never guessed -- so
     /// every other feed keeps treating one as "no date".
     var zonelessDatesTimeZone: TimeZone? = nil
+    /// Sections: the topic every story in this feed belongs to, as a `Topic` raw value ("business", "sports", "tech",
+    /// "scienceHealth", "climate", "arts", "books", "food", "travel", "style", "realEstate", "obituaries"). A String, not
+    /// `Topic`, because this file is vendored into the edition builder, which has no `Topic` type (a test pins every value
+    /// in the catalog to a real `Topic`). nil (the default) = a main-news feed. A feed that declares a topic is a TOPIC FEED:
+    /// its stories keep their own daily allowance (`ArticleStore.topicAllowance`), separate from the source's main cap, and the edition
+    /// compiler writes the hint into each bundle article.
+    var topicHint: String? = nil
+    /// Sections: a CEILING on how many stories this TOPIC feed may bring in, per day on the phone and per compile run in the edition
+    /// builder. nil = no ceiling of its own: the phone's daily allowance then follows the reader's "stories per source per day"
+    /// setting (a quarter of it, never below 2; `ArticleStore.topicAllowance`), and the builder takes
+    /// `FeedEndpoint.defaultTopicFeedMaxPerDay` per run. Read only for a topic feed (one with a `topicHint`); a main-news feed's
+    /// budget is the source's `maxPerDay` / the user's "stories per source per day" setting.
+    var maxPerDay: Int? = nil
+
+    /// The edition builder's per-run cap for a topic feed that names none of its own (the phone's daily allowance is derived from
+    /// the reader's setting instead).
+    static let defaultTopicFeedMaxPerDay = 10
+
+    /// The feed's topic hint with surrounding space removed; nil when the feed declares none (or an empty one).
+    var normalizedTopicHint: String? {
+        guard let trimmed = topicHint?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else { return nil }
+        return trimmed
+    }
+
+    /// True when the feed declares a topic.
+    var isTopicFeed: Bool { normalizedTopicHint != nil }
+
+    /// A topic feed's per-run cap in the edition builder: its own `maxPerDay`, else the default 10. Never below 1. (On the phone
+    /// `maxPerDay` is only a ceiling on the daily allowance; see `ArticleStore.topicAllowance`.)
+    var topicMaxPerDay: Int { max(1, maxPerDay ?? Self.defaultTopicFeedMaxPerDay) }
 }
 
 struct SourceConfig: Identifiable, Sendable {

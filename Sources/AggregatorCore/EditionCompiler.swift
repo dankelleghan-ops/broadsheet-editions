@@ -67,6 +67,11 @@ struct SourceRunStats {
     var staleByPageDate = 0
     /// Finding 3c: true when the per-run eligible-item cap cut this source's survey short.
     var hitItemCap = false
+    /// Sections: how many of this source's TOPIC feeds hit their own per-run cap (`FeedEndpoint.topicMaxPerDay`) this run. Each
+    /// such feed's remainder drains on later runs (its feed conditional is not committed).
+    var topicFeedsCapped = 0
+    /// Sections: new articles compiled through this source's topic feeds this run (a subset of `newArticles`).
+    var topicNewArticles = 0
 }
 
 struct RunStats {
@@ -219,6 +224,12 @@ final class EditionCompiler {
         /// guid -> the real publish time the feed now carries for an ALREADY-COMPILED article whose
         /// stored date is a guess (see `survey`); applied in Phase C.
         var dateCorrections: [String: Date] = [:]
+        /// Sections: guid -> the topic hint of the topic feed that supplied the item. Absent for an item taken through a main-news
+        /// feed.
+        var topicHints: [String: String] = [:]
+        /// Sections: the keys (URL strings) of topic feeds that hit their per-run cap this run. Their feed conditionals are NOT
+        /// committed (same reasoning as finding 3c), so the next run re-fetches the feed and drains the remainder.
+        var cappedFeedKeys: Set<String> = []
         var stats: SourceRunStats
     }
 
@@ -226,15 +237,29 @@ final class EditionCompiler {
     /// exclude patterns/prefixes, in-run guid dedupe, already-stored guid skip, rejected-URL
     /// skip -- plus the edition's own window cutoff (`publishedAt ?? now` within the last 48h,
     /// the same nil-coercion the app applies at store time).
+    ///
+    /// Sections: a feed that declares a topic (`FeedEndpoint.topicHint`) is a TOPIC FEED. Its items are tagged with that hint (it
+    /// travels into the bundle as `topicHint`) and are capped PER FEED at `FeedEndpoint.topicMaxPerDay` new items per run. They do
+    /// not count against `maxItemsPerSourcePerRun`, which now limits a source's MAIN feeds only, so a busy topic feed can never
+    /// crowd out a source's main-news feeds and a busy main feed can never starve a topic feed (a source's main feeds are listed
+    /// first and the main cap used to end the whole survey). The web-address and sports-headline rules of `ArticleGate` also run
+    /// here, before any page is fetched; the gate repeats them for what slips through.
     private func survey(source: SourceConfig, knownGUIDs: Set<String>, retainedDates: [String: CompiledArticle],
                         rejectedURLStrings: Set<String>,
                         conditionals: [String: FeedConditional], now: Date) async -> SourceSurveyResult {
         var result = SourceSurveyResult(source: source, stats: SourceRunStats(sourceID: source.id))
         var processedGUIDs = Set<String>()
         let cutoff = now.addingTimeInterval(-config.windowSeconds)
+        /// Eligible items taken through MAIN feeds: the only ones `maxItemsPerSourcePerRun` counts.
+        var mainEligibleCount = 0
 
         for feed in source.feeds {
             let feedKey = feed.url.absoluteString
+            let topicHint = feed.normalizedTopicHint
+            // Main cap reached (finding 3c): the source's remaining MAIN feeds are skipped, exactly as before. Topic feeds
+            // still run: they have their own caps.
+            if result.stats.hitItemCap && topicHint == nil { continue }
+            var feedEligibleCount = 0
             do {
                 let response = try await client.get(feed.url, conditional: conditionals[feedKey],
                                                     maxBytes: FetchLimits.pageBytes)
@@ -270,17 +295,35 @@ final class EditionCompiler {
                         continue
                     }
                     if (item.publishedAt ?? now) < cutoff { continue }
-                    if result.eligibleItems.count >= config.maxItemsPerSourcePerRun {
-                        // Finding 3c: cap reached with more eligible items still in the feed.
-                        // Marking the cap keeps this source's conditionals uncommitted (see
-                        // `download`), so the next run drains the remainder.
-                        result.stats.hitItemCap = true
-                        break
+                    // Sections: pages the gate would reject by their web address or (sports feeds) headline are skipped before
+                    // any fetch. Not negative-cached: the check is free, so it is simply repeated.
+                    if ArticleGate.addressRejectionReason(item.url) != nil { continue }
+                    if topicHint == ArticleGate.sportsTopicHint,
+                       ArticleGate.sportsFeedTitleRejectionReason(item.title) != nil { continue }
+                    if let topicHint {
+                        // Sections: a topic feed takes at most `topicMaxPerDay` new items per run, newest first (feed order).
+                        if feedEligibleCount >= feed.topicMaxPerDay {
+                            result.cappedFeedKeys.insert(feedKey)
+                            result.stats.topicFeedsCapped += 1
+                            break
+                        }
+                        processedGUIDs.insert(item.guid)
+                        result.eligibleItems.append(item)
+                        result.topicHints[item.guid] = topicHint
+                        feedEligibleCount += 1
+                    } else {
+                        if mainEligibleCount >= config.maxItemsPerSourcePerRun {
+                            // Finding 3c: cap reached with more eligible items still in the feed.
+                            // Marking the cap keeps this source's conditionals uncommitted (see
+                            // `download`), so the next run drains the remainder.
+                            result.stats.hitItemCap = true
+                            break
+                        }
+                        processedGUIDs.insert(item.guid)
+                        result.eligibleItems.append(item)
+                        mainEligibleCount += 1
                     }
-                    processedGUIDs.insert(item.guid)
-                    result.eligibleItems.append(item)
                 }
-                if result.stats.hitItemCap { break }
             } catch {
                 result.stats.feedErrors += 1
                 DiagnosticsLog.shared.log(.error, source: source.id,
@@ -313,9 +356,12 @@ final class EditionCompiler {
 
     private func download(survey: SourceSurveyResult, imagesDir: URL, now: Date) async -> SourceDownloadResult {
         // Finding 3c: a capped source commits NO conditionals -- committing one would 304 the
-        // next run straight past the eligible items this run left behind.
+        // next run straight past the eligible items this run left behind. Sections: a capped TOPIC feed (own per-run cap)
+        // withholds just its own conditional, so the next run re-fetches that feed and drains its remainder while its
+        // siblings stay cheap.
         var result = SourceDownloadResult(updatedConditionals: survey.stats.hitItemCap
-                                              ? [:] : survey.updatedConditionals,
+                                              ? [:]
+                                              : survey.updatedConditionals.filter { !survey.cappedFeedKeys.contains($0.key) },
                                           dateCorrections: survey.dateCorrections,
                                           stats: survey.stats)
         let source = survey.source
@@ -360,8 +406,13 @@ final class EditionCompiler {
                 continue
             }
 
+            let topicHint = survey.topicHints[item.guid]
             let gateResult = ArticleGate.evaluate(extracted, requiresAttribution: source.requiresAttribution,
-                                                  englishOnly: true)
+                                                  englishOnly: true, sourceID: source.id, topicHint: topicHint,
+                                                  // The 7-day age rule is for topic feeds (evergreen archives such as the
+                                                  // Guardian's travel guides), as on the phone; the survey's window cutoff
+                                                  // already bounds every other item.
+                                                  publishedAt: topicHint == nil ? nil : item.publishedAt, now: now)
             guard case .pass = gateResult else {
                 result.stats.gateRejected += 1
                 if case .fail(let reason) = gateResult {
@@ -465,9 +516,11 @@ final class EditionCompiler {
                 dateIsEstimated: dateIsEstimated,
                 bodyBlocksJSON: bodyBlocksJSON,
                 imageSHA16: imageSHA16,
-                imageSourceURL: extracted.heroImageURL?.absoluteString
+                imageSourceURL: extracted.heroImageURL?.absoluteString,
+                topicHint: topicHint
             ))
             result.stats.newArticles += 1
+            if topicHint != nil { result.stats.topicNewArticles += 1 }
         }
         return result
     }
@@ -543,7 +596,9 @@ final class EditionCompiler {
                     topImageURL: article.imageSHA16.map { "\(base)/images/\($0).jpg" },
                     attribution: article.attribution,
                     // Only a GUESSED date is flagged; a real (or legacy/unknown) one omits the key.
-                    dateIsEstimated: article.dateIsEstimated == true ? true : nil
+                    dateIsEstimated: article.dateIsEstimated == true ? true : nil,
+                    // Sections: the topic feed it came through; omitted (nil) for a main-news article.
+                    topicHint: article.topicHint
                 )
             }
         )

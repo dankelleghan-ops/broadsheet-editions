@@ -42,8 +42,35 @@ may change it unilaterally.
     "dateIsEstimated": Bool?   // ADDITIVE (2026-10-12): true ONLY when no real publish time could be found and
                                // publishedAt is the compiler's first-seen time; key omitted otherwise. Old app
                                // builds ignore it.
+    "topicHint":      String?  // ADDITIVE (sections, 2026-10-18): the Topic raw value ("business", "sports", "tech",
+                               // "scienceHealth", "climate", "arts", "books", "food", "travel", "style", "realEstate",
+                               // "obituaries") of the TOPIC FEED the article was fetched through; key omitted for an
+                               // article from a main-news feed, so a bundle with no topic feeds is byte-for-byte the old
+                               // shape. Old app builds ignore it; new builds file the story under that topic and count it
+                               // against its own daily allowance (see "Topic feeds" below).
   }
   ```
+- Topic feeds (sections, 2026-10-18): a feed in the vendored catalog may declare `FeedEndpoint.topicHint` (a Topic raw
+  value) and `FeedEndpoint.maxPerDay` (default 10). The compiler tags every article such a feed supplies with the hint
+  (`CompiledArticle.topicHint` in state, `topicHint` in the bundle), and gives each topic feed its OWN cap of
+  `topicMaxPerDay` new items per run, newest first (feed order). Topic items do not count against
+  `maxItemsPerSourcePerRun`, which now limits a source's MAIN feeds only: a busy topic feed cannot crowd out the main
+  feeds, and a source whose main feeds fill the cap still compiles its topic feeds (they are listed after the main feeds,
+  and the main cap used to end the whole survey). A topic feed that hits its cap withholds only its own feed
+  conditional, so the next run re-fetches it and drains the rest. The first feed to see a guid wins, as ever: a story
+  in both a main feed and a topic feed is compiled once, through the main feed, with no hint. The vendored `ArticleGate`
+  also runs three quality rules here: pages whose web address has a gallery / live / video / audio / podcast / picture /
+  add-to-cart / thefilter section (and CNBC's investingclub and pro) are skipped before any fetch; sports feeds drop
+  betting and fantasy headlines; NPR's topic feeds need 150 words of body. A topic feed's old items (more than 7 days) are
+  rejected by the phone's gate; the compiler's own 48-hour window already covers them. `maxPerDay` is the builder's per-run
+  cap and, on the phone, only a CEILING: the phone's daily allowance for a (source, topic) follows the reader's "stories per
+  source per day" setting (a quarter of it, never below 2: 15 -> 4, 25 -> 6, 40 -> 10, 60 -> 15), and the catalog's topic feeds
+  declare none, so the builder's per-run cap is the default 10.
+- **Rollout order for topic feeds: install the new app on Daniel's iPhone and iPad BEFORE pushing the builder change to
+  `broadsheet-editions`.** Deploying the builder first is NOT harmless: it compiles topic feeds from outlets that are already
+  in an old build's catalog (the Guardian, NPR, the Sun-Times, NY Post, Fox, ...), and an old build ingests those stories as
+  ordinary news, under the outlet's first feed's place (the Guardian's is World) and inside its 25-a-day budget. Stories
+  ingested that way stay on the device until they age out.
 - Body block (inside `bodyBlocksJSON`): `{ "kind", "text"?, "imageURLString"?, "caption"?, "credit"?, "repeatsHero"? }`.
   `repeatsHero` is **ADDITIVE (2026-10-12, "hero shown once")**: `true` ONLY on an image block that shows the SAME
   photograph as the article's hero image (`topImageURL`); the key is omitted otherwise, so a body with no repeat
