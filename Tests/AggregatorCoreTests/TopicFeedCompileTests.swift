@@ -288,17 +288,175 @@ final class TopicFeedCompileTests: XCTestCase {
         XCTAssertEqual(Set(hints(try decodeEdition()).keys), ["biz-short"])
     }
 
-    func testAStoryInBothAMainFeedAndATopicFeedKeepsTheFirstFeedsView() async throws {
-        // The first feed to see a guid wins (as it always has): the main feed's copy has no hint.
+    // MARK: - A topic feed supplies the section a main feed's copy lacks
+
+    func testAStoryInBothAMainFeedAndATopicFeedCarriesTheTopicFeedsSection() async throws {
+        // The first feed to see a guid still supplies the story (the main feed's copy is the one compiled), but the topic feed
+        // that lists it too supplies the section the main feed's copy lacks.
         stub("https://mix.example/main", host: "mix.example", [FeedItemSpec(guid: "shared")])
         stub("https://mix.example/business", host: "mix.example", [FeedItemSpec(guid: "shared"), FeedItemSpec(guid: "biz-only")])
-        _ = try await compile([source(feeds: [
+        let stats = try await compile([source(feeds: [
             feed("https://mix.example/main"), feed("https://mix.example/business", topic: "business", maxPerDay: 10)
         ])])
         let byGUID = hints(try decodeEdition())
-        XCTAssertEqual(byGUID.count, 2)
-        XCTAssertNil(byGUID["shared"] ?? nil)
+        XCTAssertEqual(byGUID.count, 2, "the shared story is compiled once")
+        XCTAssertEqual(byGUID["shared"] ?? nil, "business")
         XCTAssertEqual(byGUID["biz-only"] ?? nil, "business")
+        let perSource = try XCTUnwrap(stats.perSource.first)
+        XCTAssertEqual(perSource.topicLabelsFilled, 1, "counted apart from the stories a topic feed itself supplied")
+        XCTAssertEqual(perSource.topicNewArticles, 1)
+        XCTAssertEqual(client.requestCount(of: "https://mix.example/news/shared"), 0, "feed-text source: no page is ever fetched")
+    }
+
+    func testBetweenTwoTopicFeedsTheFirstListedLabelWins() async throws {
+        stub("https://mix.example/main", host: "mix.example", [FeedItemSpec(guid: "shared")])
+        stub("https://mix.example/business", host: "mix.example", [FeedItemSpec(guid: "shared")])
+        stub("https://mix.example/tech", host: "mix.example", [FeedItemSpec(guid: "shared"), FeedItemSpec(guid: "tech-only")])
+        _ = try await compile([source(feeds: [
+            feed("https://mix.example/main"),
+            feed("https://mix.example/business", topic: "business", maxPerDay: 10),
+            feed("https://mix.example/tech", topic: "tech", maxPerDay: 10)
+        ])])
+        let byGUID = hints(try decodeEdition())
+        XCTAssertEqual(byGUID["shared"] ?? nil, "business", "only a MISSING label is filled")
+        XCTAssertEqual(byGUID["tech-only"] ?? nil, "tech")
+    }
+
+    func testAMainFeedStoryASportsFeedListsWithABettingHeadlineStaysPlainNews() async throws {
+        stub("https://mix.example/main", host: "mix.example", [
+            FeedItemSpec(guid: "game", title: "Bears hold on to beat the Packers"),
+            FeedItemSpec(guid: "bet", title: "Week 7 NFL expert picks and odds")
+        ])
+        stub("https://mix.example/sport", host: "mix.example", [
+            FeedItemSpec(guid: "game", title: "Bears hold on to beat the Packers"),
+            FeedItemSpec(guid: "bet", title: "Week 7 NFL expert picks and odds")
+        ])
+        let stats = try await compile([source(feeds: [
+            feed("https://mix.example/main"), feed("https://mix.example/sport", topic: "sports", maxPerDay: 10)
+        ])])
+        let byGUID = hints(try decodeEdition())
+        XCTAssertEqual(byGUID.count, 2, "the betting story is still compiled: the main feed carried it")
+        XCTAssertEqual(byGUID["game"] ?? nil, "sports")
+        XCTAssertNil(byGUID["bet"] ?? nil, "a betting headline in a sports feed never labels a story")
+        XCTAssertEqual(stats.perSource.first?.topicLabelsFilled, 1)
+    }
+
+    func testAnOutOfTopicLabelDoesNotSpendTheTopicFeedsCap() async throws {
+        // Three of the business feed's four stories were already taken by the main feed. The label-only ones fetch nothing,
+        // so they do not use up the feed's cap of two: both of its own stories are still taken.
+        stub("https://mix.example/main", host: "mix.example", [FeedItemSpec(guid: "a"), FeedItemSpec(guid: "b"), FeedItemSpec(guid: "c")])
+        stub("https://mix.example/business", host: "mix.example", [
+            FeedItemSpec(guid: "a"), FeedItemSpec(guid: "b"), FeedItemSpec(guid: "c"),
+            FeedItemSpec(guid: "biz-1"), FeedItemSpec(guid: "biz-2"), FeedItemSpec(guid: "biz-3")
+        ])
+        let stats = try await compile([source(feeds: [
+            feed("https://mix.example/main"), feed("https://mix.example/business", topic: "business", maxPerDay: 2)
+        ])])
+        let byGUID = hints(try decodeEdition())
+        XCTAssertEqual(Set(byGUID.keys), ["a", "b", "c", "biz-1", "biz-2"], "biz-3 is past the cap of two; the label-only three are not")
+        for guid in byGUID.keys { XCTAssertEqual(byGUID[guid] ?? nil, "business", guid) }
+        let perSource = try XCTUnwrap(stats.perSource.first)
+        XCTAssertEqual(perSource.topicFeedsCapped, 1)
+        XCTAssertEqual(perSource.topicNewArticles, 2)
+        XCTAssertEqual(perSource.topicLabelsFilled, 3)
+    }
+
+    func testALabelNeverCostsAStoryTheTopicFeedsStricterRulesWouldReject() async throws {
+        // NPR's topic feeds need 150 words; its main feed does not. The main feed took "short" (102 words), and the business feed
+        // lists it too. With the label it would fail the 150-word floor; without it, it passes. It must ship, unlabeled, and
+        // nothing is negative-cached. "long" (170 words) passes with the label and keeps it.
+        stub("https://npr.example/main", host: "npr.example", [
+            FeedItemSpec(guid: "short", paragraphs: 3), FeedItemSpec(guid: "long", paragraphs: 5)
+        ])
+        stub("https://npr.example/business", host: "npr.example", [
+            FeedItemSpec(guid: "short", paragraphs: 3), FeedItemSpec(guid: "long", paragraphs: 5)
+        ])
+        let stats = try await compile([source(id: "npr", feeds: [
+            feed("https://npr.example/main"), feed("https://npr.example/business", topic: "business", maxPerDay: 10)
+        ])])
+        let byGUID = hints(try decodeEdition())
+        XCTAssertEqual(Set(byGUID.keys), ["short", "long"])
+        XCTAssertNil(byGUID["short"] ?? nil, "compiled as plain main news")
+        XCTAssertEqual(byGUID["long"] ?? nil, "business")
+        let perSource = try XCTUnwrap(stats.perSource.first)
+        XCTAssertEqual(perSource.gateRejected, 0)
+        XCTAssertEqual(perSource.topicLabelsFilled, 1, "only the story that kept its label")
+        XCTAssertTrue(CompilerState.load(from: stateURL).rejectedURLs.isEmpty, "no rejection is recorded for a story that shipped")
+    }
+
+    func testAStoryThatFailsTheGateWithOrWithoutTheLabelIsRejectedOnceAsBefore() async throws {
+        // One paragraph: fails the base gate (>= 3 paragraphs) whatever feed it came through.
+        stub("https://mix.example/main", host: "mix.example", [FeedItemSpec(guid: "thin", paragraphs: 1), FeedItemSpec(guid: "fine")])
+        stub("https://mix.example/business", host: "mix.example", [FeedItemSpec(guid: "thin", paragraphs: 1)])
+        let stats = try await compile([source(feeds: [
+            feed("https://mix.example/main"), feed("https://mix.example/business", topic: "business", maxPerDay: 10)
+        ])])
+        XCTAssertEqual(Set(hints(try decodeEdition()).keys), ["fine"])
+        let perSource = try XCTUnwrap(stats.perSource.first)
+        XCTAssertEqual(perSource.gateRejected, 1)
+        XCTAssertEqual(CompilerState.load(from: stateURL).rejectedURLs.count, 1)
+    }
+
+    // MARK: - A feed that answers with nothing is reported, and not remembered
+
+    private func feedErrors(_ stats: RunStats) -> Int { stats.perSource.first?.feedErrors ?? -1 }
+
+    func testAFeedThatAnswersWithAnEmptyChannelIsCountedLoggedAndNotRemembered() async throws {
+        client.stubs["https://mix.example/empty"] = .init(
+            data: Data(#"<?xml version="1.0"?><rss version="2.0"><channel><title>x</title></channel></rss>"#.utf8),
+            etag: "\"empty-1\"", lastModified: "Wed, 05 Aug 2026 11:00:00 GMT")
+        stub("https://mix.example/main", host: "mix.example", [FeedItemSpec(guid: "main-1")], etag: "\"main-1\"")
+        let errorsBefore = DiagnosticsLog.shared.errorCount
+        let stats = try await compile([source(feeds: [feed("https://mix.example/empty"), feed("https://mix.example/main")])])
+
+        XCTAssertEqual(feedErrors(stats), 1)
+        XCTAssertEqual(DiagnosticsLog.shared.errorCount - errorsBefore, 1, "one error-level log line")
+        XCTAssertEqual(Set(hints(try decodeEdition()).keys), ["main-1"], "the source's other feed still compiles")
+        let state = CompilerState.load(from: stateURL)
+        XCTAssertNil(state.feedConditionals["https://mix.example/empty"], "an empty answer stores no ETag or Last-Modified")
+        XCTAssertEqual(state.feedConditionals["https://mix.example/main"]?.etag, "\"main-1\"", "a feed with items still does")
+
+        // The next run asks for the empty feed WITHOUT a conditional, so a server that would now answer properly is believed.
+        client.notModifiedURLs = ["https://mix.example/empty"]
+        stub("https://mix.example/empty", host: "mix.example", [FeedItemSpec(guid: "empty-now-full")], etag: "\"empty-2\"")
+        let second = try await compile([source(feeds: [feed("https://mix.example/empty"), feed("https://mix.example/main")])])
+        XCTAssertEqual(feedErrors(second), 0)
+        XCTAssertEqual(second.perSource.first?.feedsNotModified, 0, "no conditional was sent, so no 304")
+        XCTAssertTrue(hints(try decodeEdition()).keys.contains("empty-now-full"))
+    }
+
+    func testAnHTMLPageAnsweredInPlaceOfAFeedIsCountedLoggedAndNotRemembered() async throws {
+        // Well-formed enough to parse as XML, so it reaches the feed parser as "zero items" rather than as an error.
+        client.stubs["https://mix.example/wall"] = .init(
+            data: Data("<html><head><title>Just a moment</title></head><body><p>Enable JavaScript and cookies to continue</p></body></html>".utf8),
+            etag: "\"wall-1\"", lastModified: nil)
+        let errorsBefore = DiagnosticsLog.shared.errorCount
+        let stats = try await compile([source(feeds: [feed("https://mix.example/wall")])])
+        XCTAssertEqual(feedErrors(stats), 1)
+        XCTAssertEqual(DiagnosticsLog.shared.errorCount - errorsBefore, 1)
+        XCTAssertNil(CompilerState.load(from: stateURL).feedConditionals["https://mix.example/wall"])
+    }
+
+    func testAFeedThatFailsToParseNoLongerStoresItsETag() async throws {
+        // An HTML document with an unclosed tag: the XML parser refuses it.
+        client.stubs["https://mix.example/broken"] = .init(
+            data: Data("<!DOCTYPE html><html><body><br><p>Access denied</body></html>".utf8), etag: "\"broken-1\"", lastModified: nil)
+        let stats = try await compile([source(feeds: [feed("https://mix.example/broken")])])
+        XCTAssertEqual(feedErrors(stats), 1)
+        XCTAssertNil(CompilerState.load(from: stateURL).feedConditionals["https://mix.example/broken"],
+                     "a stored ETag would make the next run's answer a 304 and the feed would never be read again")
+    }
+
+    func testTheEmptyAnswerPreviewIsOnePrintableLineOfAtMostTwoHundredCharacters() {
+        let messy = "  <html>\n\t<head>\u{0}<title>Just   a\u{7}  moment</title>\r\n</head>\u{200B}</html>  "
+        XCTAssertEqual(EditionCompiler.feedBodyPreview(Data(messy.utf8)), "<html> <head><title>Just a moment</title> </head></html>")
+        XCTAssertEqual(EditionCompiler.feedBodyPreview(Data()), "")
+        XCTAssertEqual(EditionCompiler.feedBodyPreview(Data([0xFF, 0xFE, 0x00, 0x41, 0xFF])), "A", "undecodable bytes are dropped")
+        let long = String(repeating: "word ", count: 200)
+        let preview = EditionCompiler.feedBodyPreview(Data(long.utf8))
+        XCTAssertLessThanOrEqual(preview.count, 200)
+        XCTAssertGreaterThan(preview.count, 150)
+        XCTAssertFalse(preview.contains("  "))
     }
 
     // MARK: - The real catalog

@@ -149,6 +149,7 @@ public enum CompileEditionMain {
             if source.staleByPageDate > 0 { parts.append("\(source.staleByPageDate) skipped (page date older than the window)") }
             if source.hitItemCap { parts.append("item cap hit (remainder drains next run)") }
             if source.topicNewArticles > 0 { parts.append("\(source.topicNewArticles) via topic feeds") }
+            if source.topicLabelsFilled > 0 { parts.append("\(source.topicLabelsFilled) sections supplied by topic feeds") }
             if source.topicFeedsCapped > 0 { parts.append("\(source.topicFeedsCapped) topic feed(s) at their per-run cap (remainder drains next run)") }
             lines.append("  \(source.sourceID): " + parts.joined(separator: ", "))
         }

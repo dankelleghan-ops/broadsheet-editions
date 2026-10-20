@@ -57,8 +57,15 @@ may change it unilaterally.
   `maxItemsPerSourcePerRun`, which now limits a source's MAIN feeds only: a busy topic feed cannot crowd out the main
   feeds, and a source whose main feeds fill the cap still compiles its topic feeds (they are listed after the main feeds,
   and the main cap used to end the whole survey). A topic feed that hits its cap withholds only its own feed
-  conditional, so the next run re-fetches it and drains the rest. The first feed to see a guid wins, as ever: a story
-  in both a main feed and a topic feed is compiled once, through the main feed, with no hint. The vendored `ArticleGate`
+  conditional, so the next run re-fetches it and drains the rest. A story listed by more than one feed is compiled
+  once, from the FIRST feed that lists it (usually the main feed), but the first topic feed that lists it supplies the
+  section (its `topicHint`) when that copy has none: NY Post's catch-all feed comes before its sports and style feeds, and
+  the phone never changes a stored story's section afterwards, so the label has to be right the first time. Only a
+  MISSING label is filled (between two topic feeds the first-listed wins), a sports feed's betting headline never labels a
+  story, nothing extra is fetched and the topic feed's per-run cap is not spent. If a label would cost the story its place
+  (the topic feed's stricter rules, such as NPR's 150-word floor), the story is judged again as the plain main-news story it
+  was and ships without the label, with no rejection recorded. The report prints "N sections supplied by topic feeds".
+  The vendored `ArticleGate`
   also runs three quality rules here: pages whose web address has a gallery / live / video / audio / podcast / picture /
   add-to-cart / thefilter section (and CNBC's investingclub and pro) are skipped before any fetch; sports feeds drop
   betting and fantasy headlines; NPR's topic feeds need 150 words of body. A topic feed's old items (more than 7 days) are
@@ -194,6 +201,11 @@ swift run -c release compile-edition \
 - The state file carries feed ETag/Last-Modified conditionals, every windowed article
   (already compiled — never re-fetched), and a 7-day negative cache of gate-rejected URLs
   (mirroring the app's GateRejectionStore). Steady-state runs are therefore mostly 304s.
+- A feed that answers (non-304) but parses to ZERO items is counted in the source's `feed errors`, logged at error level
+  (`feed answered but held no items: <url> (HTTP <status>, <bytes> bytes, starts: "...")`, with the first 200 printable
+  characters of the body) and its ETag / Last-Modified is NOT stored; a feed that fails to parse does not store one either.
+  A stored conditional would turn the next request into a 304 and the feed would never be read again. (Found when ESPN
+  answered the GitHub runner with a 2xx that held nothing: the report said "espn: 0 new" with no error.)
 - Politeness: concurrency caps mirror the app's (6 concurrent source surveys, 3 concurrent
   source downloads with pages sequential per source, hero images inside that same 3-way
   envelope), 20s timeouts, and an honest User-Agent

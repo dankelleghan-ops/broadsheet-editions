@@ -72,6 +72,9 @@ struct SourceRunStats {
     var topicFeedsCapped = 0
     /// Sections: new articles compiled through this source's topic feeds this run (a subset of `newArticles`).
     var topicNewArticles = 0
+    /// Sections: new articles a MAIN feed supplied that a topic feed of the same source supplied the section for (a subset of
+    /// `newArticles`; none of them is in `topicNewArticles`, nothing extra was fetched for them).
+    var topicLabelsFilled = 0
 }
 
 struct RunStats {
@@ -227,6 +230,9 @@ final class EditionCompiler {
         /// Sections: guid -> the topic hint of the topic feed that supplied the item. Absent for an item taken through a main-news
         /// feed.
         var topicHints: [String: String] = [:]
+        /// Sections: the guids whose `topicHints` entry came from a topic feed that only SAW a story an earlier feed (usually the
+        /// source's main feed) had already taken: the label is an add-on, never a reason to lose the story (see `download`).
+        var labelOnlyGUIDs: Set<String> = []
         /// Sections: the keys (URL strings) of topic feeds that hit their per-run cap this run. Their feed conditionals are NOT
         /// committed (same reasoning as finding 3c), so the next run re-fetches the feed and drains the remainder.
         var cappedFeedKeys: Set<String> = []
@@ -244,6 +250,14 @@ final class EditionCompiler {
     /// crowd out a source's main-news feeds and a busy main feed can never starve a topic feed (a source's main feeds are listed
     /// first and the main cap used to end the whole survey). The web-address and sports-headline rules of `ArticleGate` also run
     /// here, before any page is fetched; the gate repeats them for what slips through.
+    ///
+    /// Sections: a story is compiled once, through the FIRST feed that lists it (usually the source's main feed), but a topic feed
+    /// that lists the same story supplies its section when the first copy has none ("label only": nothing is fetched for it and
+    /// it spends none of the topic feed's cap). Between two topic feeds the first-listed still wins. The phone never changes a
+    /// stored story's section afterwards, so the label has to be right the first time the story is compiled.
+    ///
+    /// A feed that answers but holds nothing (a 2xx with an empty channel, or an error page that still parses to zero items) is
+    /// counted in `feedErrors` and logged, and its ETag / Last-Modified is NOT stored, so the next run reads it again.
     private func survey(source: SourceConfig, knownGUIDs: Set<String>, retainedDates: [String: CompiledArticle],
                         rejectedURLStrings: Set<String>,
                         conditionals: [String: FeedConditional], now: Date) async -> SourceSurveyResult {
@@ -268,16 +282,40 @@ final class EditionCompiler {
                     continue
                 }
                 result.stats.feedsFetched += 1
+                let parsed = try feedParser.parse(data: response.data, endpoint: feed)
+                if parsed.isEmpty {
+                    // A feed that answers but holds nothing is a problem to see, not an empty feed (ESPN answered the
+                    // GitHub runner with a 2xx that parsed to zero items and the run reported "0 new" with no error). Its
+                    // conditional is not stored: a stored ETag would turn the next request into a 304 and the feed would
+                    // never be read again.
+                    result.stats.feedErrors += 1
+                    DiagnosticsLog.shared.log(.error, source: source.id,
+                                              "feed answered but held no items: \(feedKey) (HTTP \(response.statusCode), \(response.data.count) bytes, starts: \"\(Self.feedBodyPreview(response.data))\")")
+                    continue
+                }
+                // Stored only after a parse that yielded items (a parse failure or an empty answer must be re-read next run).
                 if response.etag != nil || response.lastModified != nil {
                     result.updatedConditionals[feedKey] = FeedConditional(etag: response.etag,
                                                                           lastModified: response.lastModified)
                 }
-                let parsed = try feedParser.parse(data: response.data, endpoint: feed)
                 let items = FeedParser.applyGUIDAsURLPreference(to: parsed, enabled: source.preferGUIDAsURL)
                 for item in items {
                     if source.excludeURLPatterns.contains(where: { item.url.path.contains($0) }) { continue }
                     if source.excludeTitlePrefixes.contains(where: { item.title.lowercased().hasPrefix($0.lowercased()) }) { continue }
-                    if processedGUIDs.contains(item.guid) { continue }
+                    if processedGUIDs.contains(item.guid) {
+                        // Sections: an earlier feed already took this story. A topic feed that lists it too supplies the
+                        // section the first copy lacks (NY Post's catch-all feed is listed before its sports and style feeds,
+                        // so its copies had none). Only a MISSING label is filled, so between two topic feeds the first wins;
+                        // a betting headline in a sports feed stays plain news, as it would if the sports feed alone had it.
+                        // No cap is spent: nothing extra is fetched.
+                        if let topicHint, result.topicHints[item.guid] == nil,
+                           !(topicHint == ArticleGate.sportsTopicHint
+                             && ArticleGate.sportsFeedTitleRejectionReason(item.title) != nil) {
+                            result.topicHints[item.guid] = topicHint
+                            result.labelOnlyGUIDs.insert(item.guid)
+                        }
+                        continue
+                    }
                     if knownGUIDs.contains(item.guid) {
                         // Already compiled -- never re-fetched. But if its stored date is a guess (or
                         // unknown: compiled before `dateIsEstimated` existed) and the feed now carries a
@@ -332,6 +370,31 @@ final class EditionCompiler {
         }
         result.stats.eligibleItems = result.eligibleItems.count
         return result
+    }
+
+    /// The first `limit` printable characters of a feed answer for the "held no items" log line: whitespace runs collapsed to one
+    /// space, control and undecodable characters dropped. Only the head of the body is looked at.
+    static func feedBodyPreview(_ data: Data, limit: Int = 200) -> String {
+        let head = String(decoding: data.prefix(limit * 8), as: UTF8.self)
+        var preview = ""
+        var count = 0
+        var pendingSpace = false
+        for scalar in head.unicodeScalars {
+            if scalar.properties.isWhitespace {
+                pendingSpace = !preview.isEmpty
+                continue
+            }
+            switch scalar.properties.generalCategory {
+            case .control, .format, .surrogate, .privateUse, .unassigned: continue
+            default: break
+            }
+            if scalar == "\u{FFFD}" { continue }
+            if pendingSpace { preview.append(" "); count += 1; pendingSpace = false }
+            if count >= limit { break }
+            preview.unicodeScalars.append(scalar)
+            count += 1
+        }
+        return preview
     }
 
     // MARK: - Phase B: download + extract + gate + image
@@ -406,13 +469,29 @@ final class EditionCompiler {
                 continue
             }
 
-            let topicHint = survey.topicHints[item.guid]
-            let gateResult = ArticleGate.evaluate(extracted, requiresAttribution: source.requiresAttribution,
-                                                  englishOnly: true, sourceID: source.id, topicHint: topicHint,
-                                                  // The 7-day age rule is for topic feeds (evergreen archives such as the
-                                                  // Guardian's travel guides), as on the phone; the survey's window cutoff
-                                                  // already bounds every other item.
-                                                  publishedAt: topicHint == nil ? nil : item.publishedAt, now: now)
+            var topicHint = survey.topicHints[item.guid]
+            func gate(_ hint: String?) -> GateResult {
+                ArticleGate.evaluate(extracted, requiresAttribution: source.requiresAttribution,
+                                     englishOnly: true, sourceID: source.id, topicHint: hint,
+                                     // The 7-day age rule is for topic feeds (evergreen archives such as the
+                                     // Guardian's travel guides), as on the phone; the survey's window cutoff
+                                     // already bounds every other item.
+                                     publishedAt: hint == nil ? nil : item.publishedAt, now: now)
+            }
+            var gateResult = gate(topicHint)
+            if case .fail(let reason) = gateResult, survey.labelOnlyGUIDs.contains(item.guid) {
+                // Sections: a section label borrowed from a topic feed must never cost a story the main feed's copy would have
+                // carried (the topic feed's stricter rules, such as NPR's 150-word floor, are for stories that exist only
+                // there). So judge it again as the plain main-news story it was; if it passes, ship it without the label and
+                // record no rejection. If it fails that too, it is rejected exactly as it always was.
+                let plain = gate(nil)
+                if case .pass = plain {
+                    gateResult = plain
+                    topicHint = nil
+                    DiagnosticsLog.shared.log(.info, source: source.id,
+                                              "topic label dropped for \(item.guid), story kept without it: \(reason)")
+                }
+            }
             guard case .pass = gateResult else {
                 result.stats.gateRejected += 1
                 if case .fail(let reason) = gateResult {
@@ -520,7 +599,13 @@ final class EditionCompiler {
                 topicHint: topicHint
             ))
             result.stats.newArticles += 1
-            if topicHint != nil { result.stats.topicNewArticles += 1 }
+            if topicHint != nil {
+                if survey.labelOnlyGUIDs.contains(item.guid) {
+                    result.stats.topicLabelsFilled += 1
+                } else {
+                    result.stats.topicNewArticles += 1
+                }
+            }
         }
         return result
     }
