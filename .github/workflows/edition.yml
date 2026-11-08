@@ -84,7 +84,7 @@ env:
 
 jobs:
   compile:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       # Actions are pinned to full commit SHAs (not mutable tags) because this job holds a
