@@ -241,10 +241,41 @@ final class ContentExtractor {
     /// Shared by both paragraph and heading handling (v1.3.3 fix A extended this from
     /// paragraph-only to also cover headings -- see the "download the" note above).
     private static func isPromoJunkText(_ text: String, in element: Element) -> Bool {
+        if isSignupPitch(text) { return true }
         let lowered = text.lowercased()
         guard let matchedPrefix = promoPrefixes.first(where: { lowered.hasPrefix($0) }) else { return false }
         guard promoPrefixesRequiringLink.contains(matchedPrefix) else { return true }
         return (try? element.select("a").first()) != nil
+    }
+
+    // MARK: - Sign-up pitch lines (2026-11-27)
+    //
+    // A scan of the live edition (2026-11-27, 2,008 stories) found ~200 plain-text sign-up
+    // pitches that no selector caught: NY Post's "Download The California Post App, follow us on
+    // social, and subscribe to our newsletters" (59 stories), NBC's "Sign up for our newsletter,
+    // The Selection", Fox's "SIGN UP TO GET THE POLITICS NEWSLETTER" heading, BBC, NPR, Vox,
+    // Guardian, Slate, Block Club. A short line is a pitch when it asks the reader to sign up /
+    // subscribe / join AND names what they'd sign up for (newsletter, inbox, Sports+, ...), or
+    // says "sign up here"/"subscribe now". The sign-up words must stand where a call to action does (opening the line or a
+    // sentence, or after "and", "please" or a comma), so a quote like "Subscribe to nothing," the mayor said about a
+    // newsletter stays (test_extractFromFeedHTML_subscribeToProseQuote_survives). Every one of the 35 distinct lines this removed from
+    // that edition was a pitch; prose that merely mentions subscribers ("subscriber-only group
+    // chats", "subscribe for $9 per month") has no such pair and survives -- see the tests.
+    private static let signupMaxLength = 320
+    private static let signupVerb = try! NSRegularExpression(
+        pattern: #"(^|[.?!:;,–—-]\s+|\band\s+|\bplease\s+)(sign(ing)?[ -]?up|subscribe|join|get texts)\b"#, options: [.caseInsensitive])
+    private static let signupObject = try! NSRegularExpression(
+        pattern: #"\b(newsletters?|inbox(es)?|subscriber-only|sports\+|slate plus|donation)"#, options: [.caseInsensitive])
+    private static let signupStandalone = try! NSRegularExpression(
+        pattern: #"\b(sign up|subscribe) (here|now|today)\b|^sign up$"#, options: [.caseInsensitive])
+
+    static func isSignupPitch(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count <= signupMaxLength else { return false }
+        func matches(_ regex: NSRegularExpression) -> Bool {
+            regex.firstMatch(in: trimmed, range: NSRange(trimmed.startIndex..., in: trimmed)) != nil
+        }
+        return matches(signupStandalone) || (matches(signupVerb) && matches(signupObject))
     }
 
     fileprivate static func isDescendant(of ancestorTag: String, _ element: Element) -> Bool {
@@ -833,6 +864,50 @@ final class ContentExtractor {
                 try? matches.remove()
             }
         }
+        stripSignupForms(doc)
+    }
+
+    // MARK: - Newsletter sign-up boxes (2026-11-27)
+    //
+    // PBS drops an inline "Educate your inbox / Subscribe to Here's the Deal ... / Thank you.
+    // Please check your inbox to confirm." box into the middle of `.body-text`: a heading, a
+    // pitch paragraph and the form's hidden success message, all plain text once the form is
+    // flattened. No real article prose ever lives inside a <form> with an email field, so the
+    // rule is generic (every source): find each email-input form, then remove its nearest
+    // wrapper whose class or id names a sign-up (newsletter/subscribe/signup), which takes the
+    // heading and pitch with it. The wrapper must sit within a few levels of the form and hold
+    // at most a few paragraphs, so a page whose whole body wrapper happens to carry such a word
+    // can never be deleted; failing that, only the form itself goes.
+    private static let signupWords = ["newsletter", "subscribe", "signup", "sign-up", "sign_up"]
+
+    private static func stripSignupForms(_ doc: Document) {
+        guard let inputs = try? doc.select("form input[type=email]") else { return }
+        var forms: [Element] = []
+        for input in inputs.array() {
+            var node = input.parent()
+            while let current = node, current.tagName().lowercased() != "form" { node = current.parent() }
+            if let form = node, !forms.contains(where: { $0 === form }) { forms.append(form) }
+        }
+        for form in forms {
+            try? (signupWrapper(around: form) ?? form).remove()
+        }
+    }
+
+    private static func signupWrapper(around form: Element) -> Element? {
+        var node = form.parent()
+        var level = 0
+        while let current = node, level < 4 {
+            let tag = current.tagName().lowercased()
+            if ["body", "article", "main", "html"].contains(tag) { return nil }
+            let label = (((try? current.className()) ?? "") + " " + current.id()).lowercased()
+            if signupWords.contains(where: { label.contains($0) }) {
+                let paragraphs = (try? current.select("p").array().count) ?? 0
+                return paragraphs <= 3 ? current : nil
+            }
+            node = current.parent()
+            level += 1
+        }
+        return nil
     }
 
     // MARK: - v1.3.3 fix B: bound the fallback to a semantic content root
